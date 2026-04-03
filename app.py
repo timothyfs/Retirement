@@ -233,7 +233,15 @@ def monte_carlo(inp: Inputs) -> tuple[pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(inp.seed)
 
     det = deterministic(inp)
-    retirement_row = det.loc[det["Age"] == inp.retirement_age].iloc[0]
+    retirement_rows = det.loc[det["Age"] == inp.retirement_age]
+
+    if retirement_rows.empty:
+        raise ValueError(
+            f"Retirement age {inp.retirement_age} is outside the modelled age range "
+            f"{inp.age} to {inp.life_expectancy}."
+        )
+
+    retirement_row = retirement_rows.iloc[0]
     retirement_liquid = float(retirement_row["Liquid Start"])
     retirement_property = float(retirement_row["Property Start"])
 
@@ -347,11 +355,25 @@ def safety_score(success_rate: float, p10_final: float, retirement_withdrawal_ra
 
 def optimizer_retirement_age(inp: Inputs, min_age=50, max_age=65) -> pd.DataFrame:
     rows = []
-    for age in range(min_age, max_age + 1):
+
+    start_age = max(min_age, inp.age)
+    end_age = min(max_age, inp.life_expectancy)
+
+    for age in range(start_age, end_age + 1):
         test = Inputs(**{**asdict(inp), "retirement_age": age})
+
         det = deterministic(test)
+        if det.empty or age not in det["Age"].values:
+            continue
+
         mc, _ = monte_carlo(test)
-        retirement_row = det.loc[det["Age"] == age].iloc[0]
+
+        retirement_rows = det.loc[det["Age"] == age]
+        if retirement_rows.empty:
+            continue
+
+        retirement_row = retirement_rows.iloc[0]
+
         withdrawal_rate = (
             retirement_row["Net Withdrawal"] / retirement_row["Liquid Start"]
             if retirement_row["Liquid Start"] > 0
@@ -366,6 +388,7 @@ def optimizer_retirement_age(inp: Inputs, min_age=50, max_age=65) -> pd.DataFram
                 "Withdrawal Rate": withdrawal_rate,
             }
         )
+
     return pd.DataFrame(rows)
 
 
@@ -667,7 +690,7 @@ def main():
     mc_summary, mc_paths = monte_carlo(inp)
     bridge = bridge_analysis(det, inp)
     compare = scenario_compare(inp)
-    optimizer = optimizer_retirement_age(inp, 50, 65)
+    optimizer = optimizer_retirement_age(inp, inp.age, 65)
 
     retirement_row = det.loc[det["Age"] == inp.retirement_age].iloc[0]
     current_net_worth = inp.liquid_portfolio + inp.property_value - inp.mortgage
