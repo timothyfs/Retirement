@@ -80,6 +80,55 @@ def save_scenarios(data):
     SCENARIO_FILE.write_text(json.dumps(data, indent=2))
 
 
+def normalize_inputs(inp: Inputs) -> Inputs:
+    float_fields = [
+        "liquid_portfolio",
+        "property_value",
+        "mortgage",
+        "monthly_contribution",
+        "spending_pre75",
+        "spending_post75",
+        "inflation",
+        "spending_stress",
+        "your_pension",
+        "wife_pension",
+        "rental_income",
+        "consulting_income",
+        "cash_weight",
+        "equity_weight",
+        "property_weight",
+        "cash_return",
+        "equity_return",
+        "property_growth",
+        "cash_vol",
+        "equity_vol",
+        "property_sale_proceeds",
+    ]
+
+    int_fields = [
+        "age",
+        "wife_age",
+        "retirement_age",
+        "life_expectancy",
+        "your_pension_age",
+        "wife_pension_age",
+        "rental_income_start_age",
+        "consulting_start_age",
+        "consulting_end_age",
+        "property_sale_age",
+        "simulations",
+        "seed",
+    ]
+
+    for field_name in float_fields:
+        setattr(inp, field_name, float(getattr(inp, field_name)))
+
+    for field_name in int_fields:
+        setattr(inp, field_name, int(getattr(inp, field_name)))
+
+    return inp
+
+
 def blended_liquid_return(inp: Inputs) -> float:
     return inp.cash_weight * inp.cash_return + inp.equity_weight * inp.equity_return
 
@@ -419,36 +468,150 @@ def main():
     with st.sidebar:
         st.header("Scenario")
         selected_name = st.selectbox("Load scenario", names, index=names.index(DEFAULT_SCENARIO_NAME) if DEFAULT_SCENARIO_NAME in names else 0)
-        inp = Inputs(**scenarios[selected_name])
+        inp = normalize_inputs(Inputs(**scenarios[selected_name]))
 
         st.subheader("Household")
-        inp.age = st.number_input("Your age", 18, 100, inp.age)
-        inp.wife_age = st.number_input("Wife age", 18, 100, inp.wife_age)
-        inp.retirement_age = st.number_input("Retirement age", 40, 100, inp.retirement_age)
-        inp.life_expectancy = st.number_input("Life expectancy", 60, 110, inp.life_expectancy)
+        inp.age = st.number_input(
+            "Your age",
+            min_value=18,
+            max_value=100,
+            value=int(inp.age),
+            step=1,
+        )
+        inp.wife_age = st.number_input(
+            "Wife age",
+            min_value=18,
+            max_value=100,
+            value=int(inp.wife_age),
+            step=1,
+        )
+        inp.retirement_age = st.number_input(
+            "Retirement age",
+            min_value=40,
+            max_value=100,
+            value=int(inp.retirement_age),
+            step=1,
+        )
+        inp.life_expectancy = st.number_input(
+            "Life expectancy",
+            min_value=60,
+            max_value=110,
+            value=int(inp.life_expectancy),
+            step=1,
+        )
 
         st.subheader("Assets and liabilities")
-        inp.liquid_portfolio = st.number_input("Liquid portfolio (€)", 0.0, 100_000_000.0, inp.liquid_portfolio, step=10_000.0)
-        inp.property_value = st.number_input("Property value (€)", 0.0, 100_000_000.0, inp.property_value, step=10_000.0)
-        inp.mortgage = st.number_input("Mortgage (€)", 0.0, 100_000_000.0, inp.mortgage, step=5_000.0)
-        inp.monthly_contribution = st.number_input("Monthly contribution (€)", 0.0, 1_000_000.0, inp.monthly_contribution, step=500.0)
+        inp.liquid_portfolio = st.number_input(
+            "Liquid portfolio (€)",
+            min_value=0.0,
+            max_value=100_000_000.0,
+            value=float(inp.liquid_portfolio),
+            step=10_000.0,
+        )
+        inp.property_value = st.number_input(
+            "Property value (€)",
+            min_value=0.0,
+            max_value=100_000_000.0,
+            value=float(inp.property_value),
+            step=10_000.0,
+        )
+        inp.mortgage = st.number_input(
+            "Mortgage (€)",
+            min_value=0.0,
+            max_value=100_000_000.0,
+            value=float(inp.mortgage),
+            step=5_000.0,
+        )
+        inp.monthly_contribution = st.number_input(
+            "Monthly contribution (€)",
+            min_value=0.0,
+            max_value=1_000_000.0,
+            value=float(inp.monthly_contribution),
+            step=500.0,
+        )
 
         st.subheader("Spending")
-        inp.spending_pre75 = st.number_input("Spending before 75 (€)", 0.0, 10_000_000.0, inp.spending_pre75, step=5_000.0)
-        inp.spending_post75 = st.number_input("Spending after 75 (€)", 0.0, 10_000_000.0, inp.spending_post75, step=5_000.0)
+        inp.spending_pre75 = st.number_input(
+            "Spending before 75 (€)",
+            min_value=0.0,
+            max_value=10_000_000.0,
+            value=float(inp.spending_pre75),
+            step=5_000.0,
+        )
+        inp.spending_post75 = st.number_input(
+            "Spending after 75 (€)",
+            min_value=0.0,
+            max_value=10_000_000.0,
+            value=float(inp.spending_post75),
+            step=5_000.0,
+        )
         inp.inflation = st.slider("Inflation", 0.0, 0.10, inp.inflation, 0.001)
         inp.spending_stress = st.slider("Stress uplift to spending", -0.20, 0.30, inp.spending_stress, 0.01)
 
         st.subheader("Pensions and income")
-        inp.your_pension_age = st.number_input("Your pension age", 40, 100, inp.your_pension_age)
-        inp.your_pension = st.number_input("Your pension annual (€)", 0.0, 1_000_000.0, inp.your_pension, step=1_000.0)
-        inp.wife_pension_age = st.number_input("Wife pension age", 40, 100, inp.wife_pension_age)
-        inp.wife_pension = st.number_input("Wife pension annual (€)", 0.0, 1_000_000.0, inp.wife_pension, step=1_000.0)
-        inp.rental_income = st.number_input("Rental income annual (€)", 0.0, 5_000_000.0, inp.rental_income, step=1_000.0)
-        inp.rental_income_start_age = st.number_input("Rental income start age", 18, 100, inp.rental_income_start_age)
-        inp.consulting_income = st.number_input("Consulting income annual (€)", 0.0, 5_000_000.0, inp.consulting_income, step=1_000.0)
-        inp.consulting_start_age = st.number_input("Consulting start age", 18, 100, inp.consulting_start_age)
-        inp.consulting_end_age = st.number_input("Consulting end age", 18, 100, inp.consulting_end_age)
+        inp.your_pension_age = st.number_input(
+            "Your pension age",
+            min_value=40,
+            max_value=100,
+            value=int(inp.your_pension_age),
+            step=1,
+        )
+        inp.your_pension = st.number_input(
+            "Your pension annual (€)",
+            min_value=0.0,
+            max_value=1_000_000.0,
+            value=float(inp.your_pension),
+            step=1_000.0,
+        )
+        inp.wife_pension_age = st.number_input(
+            "Wife pension age",
+            min_value=40,
+            max_value=100,
+            value=int(inp.wife_pension_age),
+            step=1,
+        )
+        inp.wife_pension = st.number_input(
+            "Wife pension annual (€)",
+            min_value=0.0,
+            max_value=1_000_000.0,
+            value=float(inp.wife_pension),
+            step=1_000.0,
+        )
+        inp.rental_income = st.number_input(
+            "Rental income annual (€)",
+            min_value=0.0,
+            max_value=5_000_000.0,
+            value=float(inp.rental_income),
+            step=1_000.0,
+        )
+        inp.rental_income_start_age = st.number_input(
+            "Rental income start age",
+            min_value=18,
+            max_value=100,
+            value=int(inp.rental_income_start_age),
+            step=1,
+        )
+        inp.consulting_income = st.number_input(
+            "Consulting income annual (€)",
+            min_value=0.0,
+            max_value=5_000_000.0,
+            value=float(inp.consulting_income),
+            step=1_000.0,
+        )
+        inp.consulting_start_age = st.number_input(
+            "Consulting start age",
+            min_value=18,
+            max_value=100,
+            value=int(inp.consulting_start_age),
+            step=1,
+        )
+        inp.consulting_end_age = st.number_input(
+            "Consulting end age",
+            min_value=18,
+            max_value=100,
+            value=int(inp.consulting_end_age),
+            step=1,
+        )
 
         st.subheader("Allocation")
         inp.cash_weight = st.slider("Cash weight", 0.0, 1.0, inp.cash_weight, 0.01)
@@ -463,10 +626,28 @@ def main():
         inp.equity_vol = st.slider("Equity volatility", 0.0, 0.50, inp.equity_vol, 0.001)
 
         st.subheader("Simulation")
-        inp.property_sale_age = st.number_input("Property sale age (0 = off)", 0, 110, inp.property_sale_age)
-        inp.property_sale_proceeds = st.number_input("Property sale proceeds (€)", 0.0, 100_000_000.0, inp.property_sale_proceeds, step=10_000.0)
+        inp.property_sale_age = st.number_input(
+            "Property sale age (0 = off)",
+            min_value=0,
+            max_value=110,
+            value=int(inp.property_sale_age),
+            step=1,
+        )
+        inp.property_sale_proceeds = st.number_input(
+            "Property sale proceeds (€)",
+            min_value=0.0,
+            max_value=100_000_000.0,
+            value=float(inp.property_sale_proceeds),
+            step=10_000.0,
+        )
         inp.simulations = st.slider("Monte Carlo runs", 200, 10000, inp.simulations, 100)
-        inp.seed = st.number_input("Random seed", 1, 999999, inp.seed)
+        inp.seed = st.number_input(
+            "Random seed",
+            min_value=1,
+            max_value=999999,
+            value=int(inp.seed),
+            step=1,
+        )
 
         new_name = st.text_input("Scenario name", value=selected_name)
         c1, c2 = st.columns(2)
