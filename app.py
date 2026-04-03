@@ -1,77 +1,24 @@
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 
-st.set_page_config(
-    page_title="Retirement Planning Cockpit",
-    page_icon="📈",
-    layout="wide",
-)
+st.set_page_config(page_title="Retirement Planning Cockpit", page_icon="📈", layout="wide")
 
-st.title("Retirement Planning Cockpit")
-st.caption(
-    "Scenario-led retirement planning with deterministic projections, Monte Carlo analysis, "
-    "bridge-to-pension logic, and decision dashboards."
-)
-
+# ------------------------------------------------------------
+# Formatting
+# ------------------------------------------------------------
 CURRENCIES: Dict[str, Dict[str, str]] = {
     "EUR": {"symbol": "€", "name": "Euro"},
     "GBP": {"symbol": "£", "name": "British Pound"},
     "USD": {"symbol": "$", "name": "US Dollar"},
     "CHF": {"symbol": "CHF ", "name": "Swiss Franc"},
 }
-
-DEFAULTS = {
-    "scenario_name": "Base",
-    "load_scenario": "Base",
-    "currency": "EUR",
-    "your_age": 53,
-    "wife_age": 51,
-    "retirement_age": 55,
-    "life_expectancy": 95,
-    "liquid_portfolio": 1_070_000.0,
-    "property_value": 1_020_000.0,
-    "mortgage": 50_000.0,
-    "monthly_contribution": 5_000.0,
-    "spending_before_75": 100_000.0,
-    "spending_after_75": 80_000.0,
-    "inflation": 0.025,
-    "stress_uplift": 0.00,
-    "your_pension_age": 67,
-    "your_pension_annual": 14_000.0,
-    "wife_pension_age": 67,
-    "wife_pension_annual": 13_000.0,
-    "rental_income_annual": 24_000.0,
-    "rental_income_start_age": 55,
-    "consulting_income_annual": 10_000.0,
-    "consulting_income_start_age": 55,
-    "consulting_income_end_age": 60,
-    "cash_weight": 0.08,
-    "equity_weight": 0.62,
-    "property_weight": 0.30,
-    "cash_return": 0.02,
-    "equity_return": 0.065,
-    "property_growth": 0.025,
-    "cash_volatility": 0.01,
-    "equity_volatility": 0.16,
-    "property_volatility": 0.07,
-    "property_sale_age": 75,
-    "property_sale_proceeds": 500_000.0,
-    "mc_runs": 5000,
-    "random_seed": 42,
-}
-
-
-def init_state() -> None:
-    for key, value in DEFAULTS.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
 
 
 def fmt_money(value: float, currency: str) -> str:
@@ -83,230 +30,614 @@ def fmt_pct(value: float, digits: int = 1) -> str:
     return f"{value:.{digits}%}"
 
 
-def safe_div(numerator: float, denominator: float) -> float:
-    return 0.0 if denominator == 0 else numerator / denominator
+def safe_div(a: float, b: float) -> float:
+    return 0.0 if b == 0 else a / b
 
 
+# ------------------------------------------------------------
+# Default data
+# ------------------------------------------------------------
+DEFAULT_SETTINGS = {
+    "currency": "EUR",
+    "scenario_name": "Base",
+    "base_spending_pre75": 100_000.0,
+    "base_spending_post75": 80_000.0,
+    "inflation": 0.025,
+    "stress_uplift": 0.00,
+    "mc_runs": 3000,
+    "random_seed": 42,
+    "target_monthly_income": 10_000.0,
+    "target_success_rate": 0.85,
+    "optimizer_max_extra_work_years": 10,
+    "optimizer_property_sale_step_years": 5,
+}
+
+DEFAULT_HOUSEHOLD = pd.DataFrame(
+    [
+        {
+            "enabled": True,
+            "name": "You",
+            "current_age": 53,
+            "retirement_age": 55,
+            "life_expectancy": 95,
+            "pension_age": 67,
+            "pension_annual": 14_000.0,
+        },
+        {
+            "enabled": True,
+            "name": "Wife",
+            "current_age": 51,
+            "retirement_age": 55,
+            "life_expectancy": 95,
+            "pension_age": 67,
+            "pension_annual": 13_000.0,
+        },
+    ]
+)
+
+DEFAULT_ASSETS = pd.DataFrame(
+    [
+        {
+            "enabled": True,
+            "name": "Investment portfolio",
+            "category": "liquid",
+            "value": 1_070_000.0,
+            "annual_return": 0.060,
+            "volatility": 0.140,
+            "monthly_contribution": 5_000.0,
+            "sale_age": 0,
+            "sale_proceeds": 0.0,
+            "income_annual": 0.0,
+            "income_start_age": 0,
+            "income_end_age": 0,
+            "inflation_linked_income": False,
+        },
+        {
+            "enabled": True,
+            "name": "Main property",
+            "category": "property",
+            "value": 1_020_000.0,
+            "annual_return": 0.025,
+            "volatility": 0.070,
+            "monthly_contribution": 0.0,
+            "sale_age": 75,
+            "sale_proceeds": 500_000.0,
+            "income_annual": 0.0,
+            "income_start_age": 0,
+            "income_end_age": 0,
+            "inflation_linked_income": False,
+        },
+        {
+            "enabled": True,
+            "name": "Rental property",
+            "category": "property",
+            "value": 0.0,
+            "annual_return": 0.025,
+            "volatility": 0.070,
+            "monthly_contribution": 0.0,
+            "sale_age": 0,
+            "sale_proceeds": 0.0,
+            "income_annual": 24_000.0,
+            "income_start_age": 55,
+            "income_end_age": 95,
+            "inflation_linked_income": False,
+        },
+    ]
+)
+
+DEFAULT_LIABILITIES = pd.DataFrame(
+    [
+        {
+            "enabled": True,
+            "name": "Main mortgage",
+            "linked_asset": "Main property",
+            "balance": 50_000.0,
+            "interest_rate": 0.035,
+            "monthly_payment": 1_200.0,
+            "target_completion_age": 57,
+            "include_in_net_worth": True,
+        }
+    ]
+)
+
+DEFAULT_INCOMES = pd.DataFrame(
+    [
+        {
+            "enabled": True,
+            "name": "Consulting",
+            "annual_amount": 10_000.0,
+            "start_age": 55,
+            "end_age": 60,
+            "inflation_linked": False,
+        }
+    ]
+)
+
+DEFAULT_EXPENSES = pd.DataFrame(
+    [
+        {
+            "enabled": False,
+            "name": "Car purchase",
+            "mode": "one_off",
+            "amount": 50_000.0,
+            "start_age": 56,
+            "end_age": 56,
+            "inflation_linked": False,
+        },
+        {
+            "enabled": False,
+            "name": "Children wedding",
+            "mode": "one_off",
+            "amount": 30_000.0,
+            "start_age": 60,
+            "end_age": 60,
+            "inflation_linked": False,
+        },
+        {
+            "enabled": False,
+            "name": "Big holiday",
+            "mode": "annual",
+            "amount": 10_000.0,
+            "start_age": 55,
+            "end_age": 65,
+            "inflation_linked": True,
+        },
+        {
+            "enabled": False,
+            "name": "Car lease",
+            "mode": "monthly",
+            "amount": 800.0,
+            "start_age": 55,
+            "end_age": 60,
+            "inflation_linked": False,
+        },
+    ]
+)
+
+
+def init_state() -> None:
+    defaults = {
+        "settings": DEFAULT_SETTINGS,
+        "household_df": DEFAULT_HOUSEHOLD,
+        "assets_df": DEFAULT_ASSETS,
+        "liabilities_df": DEFAULT_LIABILITIES,
+        "incomes_df": DEFAULT_INCOMES,
+        "expenses_df": DEFAULT_EXPENSES,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            if isinstance(value, pd.DataFrame):
+                st.session_state[key] = value.copy()
+            elif isinstance(value, dict):
+                st.session_state[key] = dict(value)
+            else:
+                st.session_state[key] = value
+
+
+# ------------------------------------------------------------
+# Model helpers
+# ------------------------------------------------------------
 @dataclass
-class Inputs:
-    scenario_name: str
-    currency: str
-    your_age: int
-    wife_age: int
-    retirement_age: int
-    life_expectancy: int
-    liquid_portfolio: float
-    property_value: float
-    mortgage: float
-    monthly_contribution: float
-    spending_before_75: float
-    spending_after_75: float
-    inflation: float
-    stress_uplift: float
-    your_pension_age: int
-    your_pension_annual: float
-    wife_pension_age: int
-    wife_pension_annual: float
-    rental_income_annual: float
-    rental_income_start_age: int
-    consulting_income_annual: float
-    consulting_income_start_age: int
-    consulting_income_end_age: int
-    cash_weight: float
-    equity_weight: float
-    property_weight: float
-    cash_return: float
-    equity_return: float
-    property_growth: float
-    cash_volatility: float
-    equity_volatility: float
-    property_volatility: float
-    property_sale_age: int
-    property_sale_proceeds: float
-    mc_runs: int
-    random_seed: int
+class ModelInputs:
+    settings: dict
+    household: pd.DataFrame
+    assets: pd.DataFrame
+    liabilities: pd.DataFrame
+    incomes: pd.DataFrame
+    expenses: pd.DataFrame
 
     @property
-    def total_weight(self) -> float:
-        return self.cash_weight + self.equity_weight + self.property_weight
+    def currency(self) -> str:
+        return self.settings["currency"]
 
     @property
-    def blended_liquid_return(self) -> float:
-        return self.cash_weight * self.cash_return + self.equity_weight * self.equity_return
+    def base_spending_pre75(self) -> float:
+        return float(self.settings["base_spending_pre75"])
 
     @property
-    def blended_total_return(self) -> float:
-        return (
-            self.cash_weight * self.cash_return
-            + self.equity_weight * self.equity_return
-            + self.property_weight * self.property_growth
-        )
+    def base_spending_post75(self) -> float:
+        return float(self.settings["base_spending_post75"])
 
     @property
-    def blended_liquid_volatility(self) -> float:
-        return self.cash_weight * self.cash_volatility + self.equity_weight * self.equity_volatility
+    def inflation(self) -> float:
+        return float(self.settings["inflation"])
 
     @property
-    def current_net_worth(self) -> float:
-        return self.liquid_portfolio + self.property_value - self.mortgage
+    def stress_uplift(self) -> float:
+        return float(self.settings["stress_uplift"])
+
+    @property
+    def mc_runs(self) -> int:
+        return int(self.settings["mc_runs"])
+
+    @property
+    def random_seed(self) -> int:
+        return int(self.settings["random_seed"])
+
+    @property
+    def target_monthly_income(self) -> float:
+        return float(self.settings["target_monthly_income"])
+
+    @property
+    def target_success_rate(self) -> float:
+        return float(self.settings["target_success_rate"])
+
+    @property
+    def optimizer_max_extra_work_years(self) -> int:
+        return int(self.settings["optimizer_max_extra_work_years"])
+
+    @property
+    def optimizer_property_sale_step_years(self) -> int:
+        return int(self.settings["optimizer_property_sale_step_years"])
+
+    @property
+    def primary_current_age(self) -> int:
+        df = self.household[self.household["enabled"] == True]
+        if df.empty:
+            return 55
+        return int(df["current_age"].max())
+
+    @property
+    def retirement_age(self) -> int:
+        df = self.household[self.household["enabled"] == True]
+        if df.empty:
+            return 55
+        return int(df["retirement_age"].max())
+
+    @property
+    def life_expectancy(self) -> int:
+        df = self.household[self.household["enabled"] == True]
+        if df.empty:
+            return 95
+        return int(df["life_expectancy"].max())
+
+    @property
+    def years_to_retirement(self) -> int:
+        return max(0, self.retirement_age - self.primary_current_age)
 
 
-def get_inputs() -> Inputs:
-    return Inputs(
-        scenario_name=st.session_state.scenario_name,
-        currency=st.session_state.currency,
-        your_age=int(st.session_state.your_age),
-        wife_age=int(st.session_state.wife_age),
-        retirement_age=int(st.session_state.retirement_age),
-        life_expectancy=int(st.session_state.life_expectancy),
-        liquid_portfolio=float(st.session_state.liquid_portfolio),
-        property_value=float(st.session_state.property_value),
-        mortgage=float(st.session_state.mortgage),
-        monthly_contribution=float(st.session_state.monthly_contribution),
-        spending_before_75=float(st.session_state.spending_before_75),
-        spending_after_75=float(st.session_state.spending_after_75),
-        inflation=float(st.session_state.inflation),
-        stress_uplift=float(st.session_state.stress_uplift),
-        your_pension_age=int(st.session_state.your_pension_age),
-        your_pension_annual=float(st.session_state.your_pension_annual),
-        wife_pension_age=int(st.session_state.wife_pension_age),
-        wife_pension_annual=float(st.session_state.wife_pension_annual),
-        rental_income_annual=float(st.session_state.rental_income_annual),
-        rental_income_start_age=int(st.session_state.rental_income_start_age),
-        consulting_income_annual=float(st.session_state.consulting_income_annual),
-        consulting_income_start_age=int(st.session_state.consulting_income_start_age),
-        consulting_income_end_age=int(st.session_state.consulting_income_end_age),
-        cash_weight=float(st.session_state.cash_weight),
-        equity_weight=float(st.session_state.equity_weight),
-        property_weight=float(st.session_state.property_weight),
-        cash_return=float(st.session_state.cash_return),
-        equity_return=float(st.session_state.equity_return),
-        property_growth=float(st.session_state.property_growth),
-        cash_volatility=float(st.session_state.cash_volatility),
-        equity_volatility=float(st.session_state.equity_volatility),
-        property_volatility=float(st.session_state.property_volatility),
-        property_sale_age=int(st.session_state.property_sale_age),
-        property_sale_proceeds=float(st.session_state.property_sale_proceeds),
-        mc_runs=int(st.session_state.mc_runs),
-        random_seed=int(st.session_state.random_seed),
+def normalize_tables(raw_inputs: ModelInputs) -> ModelInputs:
+    household = raw_inputs.household.copy().fillna(
+        {
+            "enabled": True,
+            "name": "",
+            "current_age": 0,
+            "retirement_age": 0,
+            "life_expectancy": 95,
+            "pension_age": 0,
+            "pension_annual": 0.0,
+        }
+    )
+    assets = raw_inputs.assets.copy().fillna(
+        {
+            "enabled": True,
+            "name": "",
+            "category": "liquid",
+            "value": 0.0,
+            "annual_return": 0.0,
+            "volatility": 0.0,
+            "monthly_contribution": 0.0,
+            "sale_age": 0,
+            "sale_proceeds": 0.0,
+            "income_annual": 0.0,
+            "income_start_age": 0,
+            "income_end_age": 0,
+            "inflation_linked_income": False,
+        }
+    )
+    liabilities = raw_inputs.liabilities.copy().fillna(
+        {
+            "enabled": True,
+            "name": "",
+            "linked_asset": "",
+            "balance": 0.0,
+            "interest_rate": 0.0,
+            "monthly_payment": 0.0,
+            "target_completion_age": 0,
+            "include_in_net_worth": True,
+        }
+    )
+    incomes = raw_inputs.incomes.copy().fillna(
+        {
+            "enabled": True,
+            "name": "",
+            "annual_amount": 0.0,
+            "start_age": 0,
+            "end_age": 0,
+            "inflation_linked": False,
+        }
+    )
+    expenses = raw_inputs.expenses.copy().fillna(
+        {
+            "enabled": True,
+            "name": "",
+            "mode": "one_off",
+            "amount": 0.0,
+            "start_age": 0,
+            "end_age": 0,
+            "inflation_linked": False,
+        }
+    )
+
+    household = household[household["enabled"] == True].copy()
+    assets = assets[assets["enabled"] == True].copy()
+    liabilities = liabilities[liabilities["enabled"] == True].copy()
+    incomes = incomes[incomes["enabled"] == True].copy()
+    expenses = expenses[expenses["enabled"] == True].copy()
+
+    return ModelInputs(
+        settings=raw_inputs.settings,
+        household=household,
+        assets=assets,
+        liabilities=liabilities,
+        incomes=incomes,
+        expenses=expenses,
     )
 
 
-def annual_spending(age: int, inputs: Inputs) -> float:
-    base = inputs.spending_before_75 if age < 75 else inputs.spending_after_75
-    base *= 1.0 + inputs.stress_uplift
-    years_after_retirement = max(0, age - inputs.retirement_age)
-    return base * ((1.0 + inputs.inflation) ** years_after_retirement)
-
-
-def indexed_income(age: int, start_age: int, base_amount: float, inputs: Inputs) -> float:
+def income_amount_for_age(base_amount: float, start_age: int, age: int, inflation: float, inflation_linked: bool) -> float:
     if age < start_age:
         return 0.0
-    years_since_start = age - start_age
-    return base_amount * ((1.0 + inputs.inflation) ** years_since_start)
+    if not inflation_linked:
+        return float(base_amount)
+    return float(base_amount) * ((1.0 + inflation) ** max(0, age - start_age))
 
 
-def total_pension_income(age: int, inputs: Inputs) -> float:
-    return indexed_income(age, inputs.your_pension_age, inputs.your_pension_annual, inputs) + indexed_income(
-        age, inputs.wife_pension_age, inputs.wife_pension_annual, inputs
-    )
+def annual_base_spending(age: int, inputs: ModelInputs) -> float:
+    base = inputs.base_spending_pre75 if age < 75 else inputs.base_spending_post75
+    base *= (1.0 + inputs.stress_uplift)
+    return base * ((1.0 + inputs.inflation) ** max(0, age - inputs.retirement_age))
 
 
-def total_other_income(age: int, inputs: Inputs) -> float:
-    rental = inputs.rental_income_annual if age >= inputs.rental_income_start_age else 0.0
-    consulting = (
-        inputs.consulting_income_annual
-        if inputs.consulting_income_start_age <= age <= inputs.consulting_income_end_age
-        else 0.0
-    )
-    return rental + consulting
+def annual_extra_expenses(age: int, inputs: ModelInputs) -> float:
+    total = 0.0
+    for _, row in inputs.expenses.iterrows():
+        mode = str(row["mode"])
+        start_age = int(row["start_age"])
+        end_age = int(row["end_age"])
+        amount = float(row["amount"])
+        linked = bool(row["inflation_linked"])
+        if age < start_age or age > end_age:
+            continue
+        if mode == "one_off" and age != start_age:
+            continue
+
+        if mode == "monthly":
+            base = amount * 12.0
+        else:
+            base = amount
+
+        if linked:
+            base *= (1.0 + inputs.inflation) ** max(0, age - start_age)
+        total += base
+    return total
 
 
-def deterministic_projection(inputs: Inputs) -> pd.DataFrame:
-    rows: List[Dict[str, float]] = []
-    liquid = inputs.liquid_portfolio
-    property_value = inputs.property_value
-    property_sold = False
+def annual_pensions(age: int, inputs: ModelInputs) -> float:
+    total = 0.0
+    for _, row in inputs.household.iterrows():
+        pension_age = int(row["pension_age"])
+        pension_annual = float(row["pension_annual"])
+        total += income_amount_for_age(
+            base_amount=pension_annual,
+            start_age=pension_age,
+            age=age,
+            inflation=inputs.inflation,
+            inflation_linked=True,
+        )
+    return total
 
-    for age in range(inputs.your_age, inputs.retirement_age):
-        contribution = inputs.monthly_contribution * 12
-        growth = liquid * inputs.blended_liquid_return
-        liquid_end = liquid + contribution + growth
 
-        rows.append(
+def annual_other_income(age: int, inputs: ModelInputs) -> float:
+    total = 0.0
+    for _, row in inputs.incomes.iterrows():
+        start_age = int(row["start_age"])
+        end_age = int(row["end_age"])
+        if age < start_age or age > end_age:
+            continue
+        total += income_amount_for_age(
+            base_amount=float(row["annual_amount"]),
+            start_age=start_age,
+            age=age,
+            inflation=inputs.inflation,
+            inflation_linked=bool(row["inflation_linked"]),
+        )
+    for _, row in inputs.assets.iterrows():
+        start_age = int(row["income_start_age"])
+        end_age = int(row["income_end_age"]) if int(row["income_end_age"]) > 0 else inputs.life_expectancy
+        if age < start_age or age > end_age:
+            continue
+        total += income_amount_for_age(
+            base_amount=float(row["income_annual"]),
+            start_age=start_age,
+            age=age,
+            inflation=inputs.inflation,
+            inflation_linked=bool(row["inflation_linked_income"]),
+        )
+    return total
+
+
+def amortize_one_year(balance: float, annual_rate: float, monthly_payment: float) -> Tuple[float, float]:
+    total_paid = 0.0
+    bal = float(balance)
+    for _ in range(12):
+        if bal <= 0:
+            break
+        interest = bal * (annual_rate / 12.0)
+        bal += interest
+        payment = min(monthly_payment, bal) if monthly_payment > 0 else 0.0
+        bal -= payment
+        total_paid += payment
+    return max(0.0, bal), total_paid
+
+
+def build_yearly_projection(inputs: ModelInputs, mc_random_returns: np.ndarray | None = None) -> pd.DataFrame:
+    ages = list(range(inputs.primary_current_age, inputs.life_expectancy + 1))
+    years_to_ret = inputs.years_to_retirement
+
+    assets = inputs.assets.copy()
+    assets["current_value"] = assets["value"].astype(float)
+    liabilities = inputs.liabilities.copy()
+    liabilities["current_balance"] = liabilities["balance"].astype(float)
+    asset_sale_done = {name: False for name in assets["name"].tolist()}
+
+    projection_rows: List[dict] = []
+
+    liquid_categories = {"liquid", "investment", "cash", "other"}
+
+    for year_idx, age in enumerate(ages):
+        is_retired = age >= inputs.retirement_age
+
+        contributions = 0.0
+        liquid_growth = 0.0
+        property_growth = 0.0
+        asset_income = 0.0
+        asset_sale_inflow = 0.0
+
+        # Contributions and growth
+        for idx, row in assets.iterrows():
+            category = str(row["category"]).lower()
+            current_value = float(assets.at[idx, "current_value"])
+
+            if not is_retired and category in liquid_categories:
+                contrib = float(row["monthly_contribution"]) * 12.0
+                current_value += contrib
+                contributions += contrib
+
+            annual_return = float(row["annual_return"])
+            if mc_random_returns is not None and category in liquid_categories and year_idx >= years_to_ret:
+                annual_return = mc_random_returns[year_idx - years_to_ret]
+
+            growth = current_value * annual_return
+            current_value += growth
+
+            if category in liquid_categories:
+                liquid_growth += growth
+            else:
+                property_growth += growth
+
+            # Recurring asset income
+            income_start = int(row["income_start_age"])
+            income_end = int(row["income_end_age"]) if int(row["income_end_age"]) > 0 else inputs.life_expectancy
+            if age >= income_start and age <= income_end:
+                asset_income += income_amount_for_age(
+                    base_amount=float(row["income_annual"]),
+                    start_age=income_start,
+                    age=age,
+                    inflation=inputs.inflation,
+                    inflation_linked=bool(row["inflation_linked_income"]),
+                )
+
+            # Optional sale
+            sale_age = int(row["sale_age"])
+            sale_proceeds = float(row["sale_proceeds"])
+            name = str(row["name"])
+            if sale_age > 0 and age >= sale_age and not asset_sale_done.get(name, False):
+                if sale_proceeds > 0:
+                    asset_sale_inflow += sale_proceeds
+                current_value = max(0.0, current_value - sale_proceeds) if category == "property" else current_value
+                asset_sale_done[name] = True
+
+            assets.at[idx, "current_value"] = max(0.0, current_value)
+
+        # Liability amortization
+        mortgage_payments = 0.0
+        total_liabilities = 0.0
+        for idx, row in liabilities.iterrows():
+            balance = float(liabilities.at[idx, "current_balance"])
+            annual_rate = float(row["interest_rate"])
+            monthly_payment = float(row["monthly_payment"])
+            completion_age = int(row["target_completion_age"])
+            if completion_age > 0 and age > completion_age:
+                monthly_payment = 0.0 if balance <= 0 else monthly_payment
+            new_balance, paid = amortize_one_year(balance, annual_rate, monthly_payment)
+            liabilities.at[idx, "current_balance"] = new_balance
+            mortgage_payments += paid
+            if bool(row["include_in_net_worth"]):
+                total_liabilities += new_balance
+
+        pensions = annual_pensions(age, inputs)
+        other_income = annual_other_income(age, inputs)
+        total_income = pensions + other_income + asset_income
+
+        base_spending = annual_base_spending(age, inputs) if is_retired else 0.0
+        life_events = annual_extra_expenses(age, inputs)
+        total_spending = base_spending + mortgage_payments + life_events
+
+        # Fund spending from liquid pool and sale proceeds
+        liquid_mask = assets["category"].str.lower().isin(liquid_categories)
+        liquid_pool = float(assets.loc[liquid_mask, "current_value"].sum()) + asset_sale_inflow
+        net_portfolio_draw = max(0.0, total_spending - total_income) if is_retired else 0.0
+        liquid_after_draw = max(0.0, liquid_pool - net_portfolio_draw)
+
+        # Push drawdown back proportionally to liquid assets
+        prior_liquid_sum = float(assets.loc[liquid_mask, "current_value"].sum())
+        if prior_liquid_sum > 0 and liquid_after_draw >= 0:
+            ratio = liquid_after_draw / prior_liquid_sum
+            assets.loc[liquid_mask, "current_value"] = assets.loc[liquid_mask, "current_value"] * ratio
+        elif liquid_mask.any() and net_portfolio_draw > 0:
+            assets.loc[liquid_mask, "current_value"] = 0.0
+
+        liquid_assets_end = float(assets.loc[liquid_mask, "current_value"].sum())
+        non_liquid_assets_end = float(assets.loc[~liquid_mask, "current_value"].sum())
+        net_worth_end = liquid_assets_end + non_liquid_assets_end - total_liabilities
+
+        projection_rows.append(
             {
-                "phase": "Pre-retirement",
                 "age": age,
-                "liquid_start": liquid,
-                "contribution": contribution,
-                "spending": 0.0,
-                "income": 0.0,
-                "growth": growth,
-                "liquid_end": liquid_end,
-                "property_value": property_value,
-                "net_worth_end": liquid_end + property_value - inputs.mortgage,
+                "phase": "Retirement" if is_retired else "Pre-retirement",
+                "liquid_assets_end": liquid_assets_end,
+                "non_liquid_assets_end": non_liquid_assets_end,
+                "total_assets_end": liquid_assets_end + non_liquid_assets_end,
+                "liabilities_end": total_liabilities,
+                "net_worth_end": net_worth_end,
+                "contributions": contributions,
+                "liquid_growth": liquid_growth,
+                "non_liquid_growth": property_growth,
+                "income_total": total_income,
+                "pensions": pensions,
+                "other_income": other_income + asset_income,
+                "base_spending": base_spending,
+                "mortgage_payments": mortgage_payments,
+                "life_events": life_events,
+                "total_spending": total_spending,
+                "net_portfolio_draw": net_portfolio_draw,
+                "asset_sale_inflow": asset_sale_inflow,
             }
         )
-        liquid = liquid_end
 
-    for age in range(inputs.retirement_age, inputs.life_expectancy + 1):
-        spending = annual_spending(age, inputs)
-        income = total_pension_income(age, inputs) + total_other_income(age, inputs)
-        withdrawal = max(0.0, spending - income)
-
-        if inputs.property_sale_age > 0 and age >= inputs.property_sale_age and not property_sold:
-            liquid += inputs.property_sale_proceeds
-            property_value = max(0.0, property_value - inputs.property_sale_proceeds)
-            property_sold = True
-
-        growth = liquid * inputs.blended_liquid_return
-        liquid_end = max(0.0, liquid + growth - withdrawal)
-
-        rows.append(
-            {
-                "phase": "Retirement",
-                "age": age,
-                "liquid_start": liquid,
-                "contribution": 0.0,
-                "spending": spending,
-                "income": income,
-                "growth": growth,
-                "liquid_end": liquid_end,
-                "property_value": property_value,
-                "net_worth_end": liquid_end + property_value - inputs.mortgage,
-            }
-        )
-        liquid = liquid_end
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(projection_rows)
 
 
-def monte_carlo_projection(inputs: Inputs, start_liquid: float) -> pd.DataFrame:
+def monte_carlo(inputs: ModelInputs) -> pd.DataFrame:
     rng = np.random.default_rng(inputs.random_seed)
+    retirement_years = max(1, inputs.life_expectancy - inputs.retirement_age + 1)
+
+    liquid_assets = inputs.assets[inputs.assets["category"].str.lower().isin(["liquid", "investment", "cash", "other"])]
+    if liquid_assets.empty:
+        avg_return = 0.0
+        avg_vol = 0.0
+    else:
+        weights = liquid_assets["value"].clip(lower=0).astype(float)
+        total = float(weights.sum())
+        if total <= 0:
+            avg_return = float(liquid_assets["annual_return"].mean())
+            avg_vol = float(liquid_assets["volatility"].mean())
+        else:
+            weights = weights / total
+            avg_return = float((weights * liquid_assets["annual_return"].astype(float)).sum())
+            avg_vol = float((weights * liquid_assets["volatility"].astype(float)).sum())
+
+    paths = []
+    for _ in range(inputs.mc_runs):
+        returns = rng.normal(avg_return, avg_vol, retirement_years)
+        proj = build_yearly_projection(inputs, mc_random_returns=returns)
+        retirement_proj = proj[proj["age"] >= inputs.retirement_age].copy()
+        paths.append(retirement_proj["liquid_assets_end"].to_numpy())
+
     ages = list(range(inputs.retirement_age, inputs.life_expectancy + 1))
-    results = np.zeros((inputs.mc_runs, len(ages)), dtype=float)
-
-    for run in range(inputs.mc_runs):
-        liquid = start_liquid
-        property_sold = False
-
-        for idx, age in enumerate(ages):
-            spending = annual_spending(age, inputs)
-            income = total_pension_income(age, inputs) + total_other_income(age, inputs)
-            withdrawal = max(0.0, spending - income)
-
-            if inputs.property_sale_age > 0 and age >= inputs.property_sale_age and not property_sold:
-                liquid += inputs.property_sale_proceeds
-                property_sold = True
-
-            cash_r = rng.normal(inputs.cash_return, inputs.cash_volatility)
-            equity_r = rng.normal(inputs.equity_return, inputs.equity_volatility)
-            blended_liquid_return = inputs.cash_weight * cash_r + inputs.equity_weight * equity_r
-
-            liquid = max(0.0, liquid * (1.0 + blended_liquid_return) - withdrawal)
-            results[run, idx] = liquid
-
-    return pd.DataFrame(results, columns=ages)
+    mc_df = pd.DataFrame(paths, columns=ages)
+    return mc_df
 
 
 def summarize_mc(mc_df: pd.DataFrame) -> Dict[str, float]:
@@ -327,233 +658,411 @@ def safety_label(success_rate: float) -> str:
     return "At Risk"
 
 
+def optimize_to_target(inputs: ModelInputs) -> Tuple[pd.DataFrame, List[str]]:
+    rows = []
+    notes = []
+
+    # Baseline
+    baseline_proj = build_yearly_projection(inputs)
+    baseline_mc = monte_carlo(inputs)
+    baseline_summary = summarize_mc(baseline_mc)
+    baseline_row = baseline_proj[baseline_proj["age"] == inputs.retirement_age].iloc[0]
+    baseline_target = inputs.target_monthly_income * 12.0
+
+    rows.append(
+        {
+            "strategy": "Current plan",
+            "retirement_age": inputs.retirement_age,
+            "target_income": baseline_target,
+            "success_rate": baseline_summary["success_rate"],
+            "liquid_at_retirement": baseline_row["liquid_assets_end"],
+        }
+    )
+
+    # Extra work years search
+    found = False
+    for extra_years in range(1, inputs.optimizer_max_extra_work_years + 1):
+        trial = ModelInputs(
+            settings=dict(inputs.settings),
+            household=inputs.household.copy(),
+            assets=inputs.assets.copy(),
+            liabilities=inputs.liabilities.copy(),
+            incomes=inputs.incomes.copy(),
+            expenses=inputs.expenses.copy(),
+        )
+        trial.household.loc[:, "retirement_age"] = trial.household["retirement_age"].astype(int) + extra_years
+        trial_proj = build_yearly_projection(trial)
+        trial_mc = monte_carlo(trial)
+        trial_summary = summarize_mc(trial_mc)
+        trial_row = trial_proj[trial_proj["age"] == trial.retirement_age].iloc[0]
+
+        rows.append(
+            {
+                "strategy": f"Work {extra_years} more year(s)",
+                "retirement_age": trial.retirement_age,
+                "target_income": baseline_target,
+                "success_rate": trial_summary["success_rate"],
+                "liquid_at_retirement": trial_row["liquid_assets_end"],
+            }
+        )
+        if not found and trial_summary["success_rate"] >= inputs.target_success_rate:
+            notes.append(
+                f"Working {extra_years} more year(s) reaches about {fmt_pct(trial_summary['success_rate'])} success, "
+                f"which clears your target of {fmt_pct(inputs.target_success_rate)}."
+            )
+            found = True
+            break
+
+    # Property sale search
+    properties = inputs.assets[inputs.assets["category"].str.lower() == "property"].copy()
+    for _, prop in properties.iterrows():
+        if float(prop["value"]) <= 0 and float(prop["sale_proceeds"]) <= 0:
+            continue
+        prop_name = str(prop["name"])
+        for sale_age in range(inputs.retirement_age, inputs.life_expectancy + 1, max(1, inputs.optimizer_property_sale_step_years)):
+            trial = ModelInputs(
+                settings=dict(inputs.settings),
+                household=inputs.household.copy(),
+                assets=inputs.assets.copy(),
+                liabilities=inputs.liabilities.copy(),
+                incomes=inputs.incomes.copy(),
+                expenses=inputs.expenses.copy(),
+            )
+            mask = trial.assets["name"] == prop_name
+            trial.assets.loc[mask, "sale_age"] = sale_age
+            if float(trial.assets.loc[mask, "sale_proceeds"].iloc[0]) <= 0:
+                trial.assets.loc[mask, "sale_proceeds"] = float(trial.assets.loc[mask, "value"].iloc[0])
+
+            trial_proj = build_yearly_projection(trial)
+            trial_mc = monte_carlo(trial)
+            trial_summary = summarize_mc(trial_mc)
+            trial_row = trial_proj[trial_proj["age"] == trial.retirement_age].iloc[0]
+
+            rows.append(
+                {
+                    "strategy": f"Sell {prop_name} at age {sale_age}",
+                    "retirement_age": trial.retirement_age,
+                    "target_income": baseline_target,
+                    "success_rate": trial_summary["success_rate"],
+                    "liquid_at_retirement": trial_row["liquid_assets_end"],
+                }
+            )
+
+    results = pd.DataFrame(rows).sort_values(["success_rate", "liquid_at_retirement"], ascending=[False, False]).reset_index(drop=True)
+
+    if results.iloc[0]["strategy"] != "Current plan":
+        top = results.iloc[0]
+        notes.append(
+            f"Best simple lever in the current search space: **{top['strategy']}**. "
+            f"That gets you to about {fmt_pct(float(top['success_rate']))} success."
+        )
+
+    notes.append(
+        "This reverse planner is intentionally simple. It searches one lever at a time so it stays transparent. "
+        "The next step would be a true multi-variable optimizer that combines retirement age, spending, sale timing, and extra income."
+    )
+    return results, notes
+
+
+# ------------------------------------------------------------
+# UI
+# ------------------------------------------------------------
 init_state()
+
+st.title("Retirement Planning Cockpit")
+st.caption(
+    "Scenario-led retirement planning with deterministic projections, Monte Carlo analysis, liabilities, life events, and reverse planning."
+)
 
 with st.sidebar:
     st.header("Display")
-    st.selectbox(
+    settings = st.session_state["settings"]
+    settings["currency"] = st.selectbox(
         "Currency",
         options=list(CURRENCIES.keys()),
+        index=list(CURRENCIES.keys()).index(settings["currency"]),
         format_func=lambda code: f"{code} — {CURRENCIES[code]['name']}",
-        key="currency",
-        help="Changes display symbol and formatting only. It does not convert values or FX rates.",
     )
-    st.markdown(
-        "All money fields use **thousands separators** for easier reading. "
-        "Use **Apply inputs** after edits so the app updates in one pass."
-    )
-
-with st.form("retirement_input_form", clear_on_submit=False):
-    tab_cockpit, tab_plan, tab_monte_carlo, tab_bridge, tab_scenarios = st.tabs(
-        ["Cockpit", "Plan", "Monte Carlo", "Bridge", "Scenarios"]
+    settings["scenario_name"] = st.text_input("Scenario name", value=settings["scenario_name"])
+    st.session_state["settings"] = settings
+    st.info(
+        "Outputs use comma separators. Number editors may still show raw numeric entry while typing on some devices."
     )
 
-    with tab_cockpit:
-        st.subheader("Scenario")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.text_input("Scenario name", key="scenario_name")
-        with c2:
-            st.selectbox("Load scenario", options=["Base"], key="load_scenario")
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Cockpit", "Household", "Assets & Debt", "Income & Events", "Monte Carlo", "Reverse Planner"]
+)
 
-        st.subheader("Household")
-        h1, h2, h3, h4 = st.columns(4)
-        h1.number_input("Your age", min_value=18, max_value=100, step=1, format="%d", key="your_age")
-        h2.number_input("Wife age", min_value=18, max_value=100, step=1, format="%d", key="wife_age")
-        h3.number_input("Retirement age", min_value=18, max_value=100, step=1, format="%d", key="retirement_age")
-        h4.number_input("Life expectancy", min_value=18, max_value=110, step=1, format="%d", key="life_expectancy")
+with tab1:
+    st.subheader("Core assumptions")
+    c1, c2, c3, c4 = st.columns(4)
+    settings = st.session_state["settings"]
+    settings["base_spending_pre75"] = c1.number_input("Base spending before 75", min_value=0.0, value=float(settings["base_spending_pre75"]), step=1_000.0)
+    settings["base_spending_post75"] = c2.number_input("Base spending after 75", min_value=0.0, value=float(settings["base_spending_post75"]), step=1_000.0)
+    settings["inflation"] = c3.slider("Inflation", 0.0, 0.10, float(settings["inflation"]), step=0.001, format="%.1f%%")
+    settings["stress_uplift"] = c4.slider("Stress uplift to spending", -0.20, 0.30, float(settings["stress_uplift"]), step=0.01, format="%.0f%%")
+    st.session_state["settings"] = settings
 
-        st.subheader("Assets and liabilities")
-        a1, a2, a3, a4 = st.columns(4)
-        a1.number_input("Liquid portfolio", min_value=0.0, step=1_000.0, format="%0.0f", key="liquid_portfolio")
-        a2.number_input("Property value", min_value=0.0, step=1_000.0, format="%0.0f", key="property_value")
-        a3.number_input("Mortgage", min_value=0.0, step=1_000.0, format="%0.0f", key="mortgage")
-        a4.number_input("Monthly contribution", min_value=0.0, step=100.0, format="%0.0f", key="monthly_contribution")
+    raw_inputs = ModelInputs(
+        settings=st.session_state["settings"],
+        household=st.session_state["household_df"],
+        assets=st.session_state["assets_df"],
+        liabilities=st.session_state["liabilities_df"],
+        incomes=st.session_state["incomes_df"],
+        expenses=st.session_state["expenses_df"],
+    )
+    inputs = normalize_tables(raw_inputs)
 
-        st.subheader("Spending")
-        s1, s2, s3, s4 = st.columns(4)
-        s1.number_input("Spending before 75", min_value=0.0, step=1_000.0, format="%0.0f", key="spending_before_75")
-        s2.number_input("Spending after 75", min_value=0.0, step=1_000.0, format="%0.0f", key="spending_after_75")
-        s3.slider("Inflation", min_value=0.0, max_value=0.10, step=0.001, format="%.1f%%", key="inflation")
-        s4.slider("Stress uplift to spending", min_value=-0.20, max_value=0.30, step=0.01, format="%.0f%%", key="stress_uplift")
+    if inputs.household.empty:
+        st.warning("Enable at least one household member.")
+    else:
+        projection = build_yearly_projection(inputs)
+        mc_df = monte_carlo(inputs)
+        mc_summary = summarize_mc(mc_df)
+        retirement_row = projection[projection["age"] == inputs.retirement_age].iloc[0]
+        success = mc_summary["success_rate"]
+        safety = safety_label(success)
+        annual_target_income = inputs.target_monthly_income * 12.0
+        withdrawal_rate = safe_div(retirement_row["net_portfolio_draw"], retirement_row["liquid_assets_end"])
 
-        st.subheader("Pensions and income")
-        p1, p2, p3, p4 = st.columns(4)
-        p1.number_input("Your pension age", min_value=18, max_value=100, step=1, format="%d", key="your_pension_age")
-        p2.number_input("Your pension annual", min_value=0.0, step=500.0, format="%0.0f", key="your_pension_annual")
-        p3.number_input("Wife pension age", min_value=18, max_value=100, step=1, format="%d", key="wife_pension_age")
-        p4.number_input("Wife pension annual", min_value=0.0, step=500.0, format="%0.0f", key="wife_pension_annual")
-
-        i1, i2, i3, i4 = st.columns(4)
-        i1.number_input("Rental income annual", min_value=0.0, step=1_000.0, format="%0.0f", key="rental_income_annual")
-        i2.number_input("Rental income start age", min_value=18, max_value=100, step=1, format="%d", key="rental_income_start_age")
-        i3.number_input("Consulting income annual", min_value=0.0, step=1_000.0, format="%0.0f", key="consulting_income_annual")
-        i4.number_input("Consulting start age", min_value=18, max_value=100, step=1, format="%d", key="consulting_income_start_age")
-
-        ce1, ce2 = st.columns([1, 3])
-        ce1.number_input("Consulting end age", min_value=18, max_value=100, step=1, format="%d", key="consulting_income_end_age")
-        ce2.markdown("")
-
-    with tab_plan:
-        st.subheader("Allocation")
-        w1, w2, w3 = st.columns(3)
-        w1.slider("Cash weight", min_value=0.0, max_value=1.0, step=0.01, key="cash_weight")
-        w2.slider("Equity weight", min_value=0.0, max_value=1.0, step=0.01, key="equity_weight")
-        w3.slider("Property weight", min_value=0.0, max_value=1.0, step=0.01, key="property_weight")
-
-        r1, r2, r3 = st.columns(3)
-        r1.slider("Cash return", min_value=-0.02, max_value=0.10, step=0.001, format="%.1f%%", key="cash_return")
-        r2.slider("Equity return", min_value=-0.05, max_value=0.15, step=0.001, format="%.1f%%", key="equity_return")
-        r3.slider("Property growth", min_value=-0.05, max_value=0.12, step=0.001, format="%.1f%%", key="property_growth")
-
-        v1, v2, v3 = st.columns(3)
-        v1.slider("Cash volatility", min_value=0.0, max_value=0.10, step=0.001, format="%.1f%%", key="cash_volatility")
-        v2.slider("Equity volatility", min_value=0.0, max_value=0.50, step=0.001, format="%.1f%%", key="equity_volatility")
-        v3.slider("Property volatility", min_value=0.0, max_value=0.25, step=0.001, format="%.1f%%", key="property_volatility")
-
-    with tab_monte_carlo:
-        st.subheader("Simulation")
         m1, m2, m3, m4 = st.columns(4)
-        m1.number_input("Property sale age (0 = off)", min_value=0, max_value=110, step=1, format="%d", key="property_sale_age")
-        m2.number_input("Property sale proceeds", min_value=0.0, step=10_000.0, format="%0.0f", key="property_sale_proceeds")
-        m3.number_input("Monte Carlo runs", min_value=200, max_value=10000, step=100, format="%d", key="mc_runs")
-        m4.number_input("Random seed", min_value=0, max_value=999999, step=1, format="%d", key="random_seed")
+        m1.metric("Current net worth", fmt_money(float(projection.iloc[0]["net_worth_end"]), inputs.currency))
+        m2.metric("Liquid at retirement", fmt_money(float(retirement_row["liquid_assets_end"]), inputs.currency))
+        m3.metric("Success rate", fmt_pct(success))
+        m4.metric("Retirement withdrawal rate", fmt_pct(withdrawal_rate))
+
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Net portfolio draw at retirement", fmt_money(float(retirement_row["net_portfolio_draw"]), inputs.currency))
+        m6.metric("Median final liquid", fmt_money(float(mc_summary["median_final_liquid"]), inputs.currency))
+        m7.metric("10th percentile final liquid", fmt_money(float(mc_summary["p10_final_liquid"]), inputs.currency))
+        m8.metric("Target monthly income", fmt_money(float(inputs.target_monthly_income), inputs.currency))
+
+        st.subheader("Retirement safety")
+        if safety == "Healthy":
+            st.success(f"{safety} — current plan looks resilient on these assumptions.")
+        elif safety == "Watchlist":
+            st.warning(f"{safety} — the plan may work, but sequence risk and spending pressure matter.")
+        else:
+            st.error(f"{safety} — retirement age, spending, debt schedule, or asset strategy likely need work.")
+
+        cashflow_df = pd.DataFrame(
+            {
+                "Item": [
+                    "Base spending",
+                    "Mortgage / debt payments",
+                    "Life events",
+                    "Pensions",
+                    "Other income",
+                    "Net portfolio draw",
+                ],
+                "Value": [
+                    float(retirement_row["base_spending"]),
+                    float(retirement_row["mortgage_payments"]),
+                    float(retirement_row["life_events"]),
+                    float(retirement_row["pensions"]),
+                    float(retirement_row["other_income"]),
+                    float(retirement_row["net_portfolio_draw"]),
+                ],
+            }
+        )
+        cashflow_df["Display"] = cashflow_df["Value"].map(lambda x: fmt_money(x, inputs.currency))
+        st.subheader("Retirement year cash flow")
+        st.dataframe(cashflow_df[["Item", "Display"]], use_container_width=True, hide_index=True)
+
+        chart_df = projection[["age", "liquid_assets_end", "net_worth_end"]].set_index("age")
+        st.subheader("Projection")
+        st.line_chart(chart_df)
+
+with tab2:
+    st.subheader("Household members")
+    st.caption("Disable the spouse row if you want a single-person plan.")
+    household_df = st.data_editor(
+        st.session_state["household_df"],
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "enabled": st.column_config.CheckboxColumn("Enabled"),
+            "name": st.column_config.TextColumn("Name"),
+            "current_age": st.column_config.NumberColumn("Current age", step=1),
+            "retirement_age": st.column_config.NumberColumn("Retirement age", step=1),
+            "life_expectancy": st.column_config.NumberColumn("Life expectancy", step=1),
+            "pension_age": st.column_config.NumberColumn("Pension age", step=1),
+            "pension_annual": st.column_config.NumberColumn("Pension annual", step=1000, format="%.0f"),
+        },
+        key="household_editor",
+    )
+    st.session_state["household_df"] = household_df
+
+with tab3:
+    st.subheader("Assets")
+    assets_df = st.data_editor(
+        st.session_state["assets_df"],
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "enabled": st.column_config.CheckboxColumn("Enabled"),
+            "name": st.column_config.TextColumn("Name"),
+            "category": st.column_config.SelectboxColumn("Category", options=["liquid", "property", "investment", "cash", "other"]),
+            "value": st.column_config.NumberColumn("Value", step=1000, format="%.0f"),
+            "annual_return": st.column_config.NumberColumn("Annual return", step=0.001, format="%.3f"),
+            "volatility": st.column_config.NumberColumn("Volatility", step=0.001, format="%.3f"),
+            "monthly_contribution": st.column_config.NumberColumn("Monthly contribution", step=100, format="%.0f"),
+            "sale_age": st.column_config.NumberColumn("Sale age (0 off)", step=1),
+            "sale_proceeds": st.column_config.NumberColumn("Sale proceeds", step=1000, format="%.0f"),
+            "income_annual": st.column_config.NumberColumn("Annual income", step=1000, format="%.0f"),
+            "income_start_age": st.column_config.NumberColumn("Income start age", step=1),
+            "income_end_age": st.column_config.NumberColumn("Income end age", step=1),
+            "inflation_linked_income": st.column_config.CheckboxColumn("Inflation linked income"),
+        },
+        key="assets_editor",
+    )
+    st.session_state["assets_df"] = assets_df
+
+    st.subheader("Liabilities / mortgages")
+    st.caption("Set a monthly payment and target completion age for each debt.")
+    liabilities_df = st.data_editor(
+        st.session_state["liabilities_df"],
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "enabled": st.column_config.CheckboxColumn("Enabled"),
+            "name": st.column_config.TextColumn("Name"),
+            "linked_asset": st.column_config.TextColumn("Linked asset"),
+            "balance": st.column_config.NumberColumn("Balance", step=1000, format="%.0f"),
+            "interest_rate": st.column_config.NumberColumn("Interest rate", step=0.001, format="%.3f"),
+            "monthly_payment": st.column_config.NumberColumn("Monthly payment", step=100, format="%.0f"),
+            "target_completion_age": st.column_config.NumberColumn("Target completion age", step=1),
+            "include_in_net_worth": st.column_config.CheckboxColumn("Include in net worth"),
+        },
+        key="liabilities_editor",
+    )
+    st.session_state["liabilities_df"] = liabilities_df
+
+with tab4:
+    st.subheader("Other income sources")
+    incomes_df = st.data_editor(
+        st.session_state["incomes_df"],
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "enabled": st.column_config.CheckboxColumn("Enabled"),
+            "name": st.column_config.TextColumn("Name"),
+            "annual_amount": st.column_config.NumberColumn("Annual amount", step=1000, format="%.0f"),
+            "start_age": st.column_config.NumberColumn("Start age", step=1),
+            "end_age": st.column_config.NumberColumn("End age", step=1),
+            "inflation_linked": st.column_config.CheckboxColumn("Inflation linked"),
+        },
+        key="incomes_editor",
+    )
+    st.session_state["incomes_df"] = incomes_df
+
+    st.subheader("Big expense items / life events")
+    st.caption("Use one-off for weddings, education, house works, or car purchases. Use monthly for leases. Use annual for recurring holidays.")
+    expenses_df = st.data_editor(
+        st.session_state["expenses_df"],
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "enabled": st.column_config.CheckboxColumn("Enabled"),
+            "name": st.column_config.TextColumn("Name"),
+            "mode": st.column_config.SelectboxColumn("Mode", options=["one_off", "monthly", "annual"]),
+            "amount": st.column_config.NumberColumn("Amount", step=1000, format="%.0f"),
+            "start_age": st.column_config.NumberColumn("Start age", step=1),
+            "end_age": st.column_config.NumberColumn("End age", step=1),
+            "inflation_linked": st.column_config.CheckboxColumn("Inflation linked"),
+        },
+        key="expenses_editor",
+    )
+    st.session_state["expenses_df"] = expenses_df
+
+with tab5:
+    st.subheader("Monte Carlo settings")
+    settings = st.session_state["settings"]
+    c1, c2 = st.columns(2)
+    settings["mc_runs"] = c1.number_input("Monte Carlo runs", min_value=500, max_value=10000, value=int(settings["mc_runs"]), step=500)
+    settings["random_seed"] = c2.number_input("Random seed", min_value=0, max_value=999999, value=int(settings["random_seed"]), step=1)
+    st.session_state["settings"] = settings
+
+    raw_inputs = ModelInputs(
+        settings=st.session_state["settings"],
+        household=st.session_state["household_df"],
+        assets=st.session_state["assets_df"],
+        liabilities=st.session_state["liabilities_df"],
+        incomes=st.session_state["incomes_df"],
+        expenses=st.session_state["expenses_df"],
+    )
+    inputs = normalize_tables(raw_inputs)
+
+    if not inputs.household.empty:
+        mc_df = monte_carlo(inputs)
+        mc_chart = pd.DataFrame(
+            {
+                "Age": mc_df.columns.astype(int),
+                "Median": mc_df.median(axis=0).values,
+                "10th percentile": mc_df.quantile(0.10, axis=0).values,
+                "90th percentile": mc_df.quantile(0.90, axis=0).values,
+            }
+        ).set_index("Age")
+        st.line_chart(mc_chart)
+
+        with st.expander("Simulation notes", expanded=False):
+            st.markdown(
+                """
+                - Monte Carlo currently shocks liquid asset returns only.
+                - Property assets are modelled deterministically unless sold.
+                - Debts, pensions, rental income, and life events flow through every scenario.
+                """
+            )
+
+with tab6:
+    st.subheader("Reverse planner")
+    settings = st.session_state["settings"]
+    rp1, rp2, rp3 = st.columns(3)
+    settings["target_monthly_income"] = rp1.number_input("Target monthly income", min_value=0.0, value=float(settings["target_monthly_income"]), step=500.0)
+    settings["target_success_rate"] = rp2.slider("Target success rate", 0.50, 0.99, float(settings["target_success_rate"]), step=0.01, format="%.0f%%")
+    settings["optimizer_max_extra_work_years"] = rp3.number_input("Max extra work years to test", min_value=1, max_value=20, value=int(settings["optimizer_max_extra_work_years"]), step=1)
+    settings["optimizer_property_sale_step_years"] = st.number_input(
+        "Property sale timing step (years)", min_value=1, max_value=10, value=int(settings["optimizer_property_sale_step_years"]), step=1
+    )
+    st.session_state["settings"] = settings
+
+    raw_inputs = ModelInputs(
+        settings=st.session_state["settings"],
+        household=st.session_state["household_df"],
+        assets=st.session_state["assets_df"],
+        liabilities=st.session_state["liabilities_df"],
+        incomes=st.session_state["incomes_df"],
+        expenses=st.session_state["expenses_df"],
+    )
+    inputs = normalize_tables(raw_inputs)
+
+    if not inputs.household.empty:
+        results, notes = optimize_to_target(inputs)
+        display = results.copy()
+        display["success_rate"] = display["success_rate"].map(lambda x: fmt_pct(float(x)))
+        display["target_income"] = display["target_income"].map(lambda x: fmt_money(float(x), inputs.currency))
+        display["liquid_at_retirement"] = display["liquid_at_retirement"].map(lambda x: fmt_money(float(x), inputs.currency))
+        st.dataframe(display.head(12), use_container_width=True, hide_index=True)
+
+        st.subheader("What the model sees")
+        for note in notes:
+            st.markdown(f"- {note}")
 
         st.info(
-            "This model uses annual normal return assumptions for liquid assets, "
-            "bridge-to-pension income logic, and optional property-sale proceeds."
+            "This reverse planner is a first optimisation layer. A stronger version would test combined actions such as "
+            "working longer plus reducing a future car lease plus selling a property at a chosen age."
         )
 
-    with tab_bridge:
-        st.subheader("Bridge logic")
-        st.markdown(
-            """
-            - Spending inflates from retirement onward.
-            - State pensions start at the ages you set and are indexed using the inflation assumption.
-            - Rental and consulting income reduce portfolio withdrawals.
-            - Property sale proceeds are injected into liquid assets once at the chosen sale age.
-            """
-        )
-
-    with tab_scenarios:
-        st.subheader("Scenario ideas")
-        st.markdown(
-            """
-            - **Base**: your central case.
-            - **Delay retirement**: push retirement age by 2 to 5 years.
-            - **Defensive**: lower returns, lower spending, more cash.
-            - **Stress test**: higher inflation, lower returns, spending uplift.
-            """
-        )
-
-    st.form_submit_button("Apply inputs", type="primary", use_container_width=True)
-
-inputs = get_inputs()
-
-if not math.isclose(inputs.total_weight, 1.0, abs_tol=0.01):
-    st.warning(
-        f"Allocation total is {inputs.total_weight:.0%}. Aim for 100% so returns and volatility are coherent."
-    )
-
-projection = deterministic_projection(inputs)
-retirement_row = projection.query("phase == 'Retirement' and age == @inputs.retirement_age").iloc[0]
-retirement_liquid = float(retirement_row["liquid_start"])
-retirement_spending = annual_spending(inputs.retirement_age, inputs)
-retirement_income = total_pension_income(inputs.retirement_age, inputs) + total_other_income(inputs.retirement_age, inputs)
-net_withdrawal = max(0.0, retirement_spending - retirement_income)
-withdrawal_rate = safe_div(net_withdrawal, retirement_liquid)
-
-mc_df = monte_carlo_projection(inputs, retirement_liquid)
-mc_summary = summarize_mc(mc_df)
-safety = safety_label(mc_summary["success_rate"])
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Current net worth", fmt_money(inputs.current_net_worth, inputs.currency))
-m2.metric("Liquid at retirement", fmt_money(retirement_liquid, inputs.currency))
-m3.metric("Success rate", fmt_pct(mc_summary["success_rate"]))
-m4.metric("Retirement withdrawal rate", fmt_pct(withdrawal_rate))
-
-m5, m6, m7, m8 = st.columns(4)
-m5.metric("Net withdrawal at retirement", fmt_money(net_withdrawal, inputs.currency))
-m6.metric("Median final liquid", fmt_money(mc_summary["median_final_liquid"], inputs.currency))
-m7.metric("10th percentile final liquid", fmt_money(mc_summary["p10_final_liquid"], inputs.currency))
-m8.metric("Blended liquid return", fmt_pct(inputs.blended_liquid_return))
-
-st.subheader("Retirement safety")
-if safety == "Healthy":
-    st.success(f"{safety} — current plan looks resilient on these assumptions.")
-elif safety == "Watchlist":
-    st.warning(f"{safety} — the plan may work, but spending pressure and sequence risk matter.")
-else:
-    st.error(f"{safety} — retirement age, spending, or allocation likely need work.")
-
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Years to both pensions", str(max(inputs.your_pension_age, inputs.wife_pension_age) - inputs.retirement_age))
-k2.metric("Spending before 75", fmt_money(inputs.spending_before_75, inputs.currency))
-k3.metric("Spending after 75", fmt_money(inputs.spending_after_75, inputs.currency))
-k4.metric("Property sale enabled", "Yes" if inputs.property_sale_age > 0 else "No")
-
-st.subheader("Retirement year cash flow")
-cashflow_df = pd.DataFrame(
-    {
-        "Item": [
-            "Spending need",
-            "State pensions",
-            "Rental income",
-            "Consulting income",
-            "Net portfolio withdrawal",
-        ],
-        "Value": [
-            retirement_spending,
-            total_pension_income(inputs.retirement_age, inputs),
-            inputs.rental_income_annual if inputs.retirement_age >= inputs.rental_income_start_age else 0.0,
-            inputs.consulting_income_annual
-            if inputs.consulting_income_start_age <= inputs.retirement_age <= inputs.consulting_income_end_age
-            else 0.0,
-            net_withdrawal,
-        ],
-    }
+st.divider()
+st.subheader("High value improvements to consider next")
+st.markdown(
+    """
+- Taxes by country and account type, especially if you want GBP, EUR, USD, and CHF handled properly rather than just symbol switching.
+- FX modelling, so a GBP pension can fund a EUR lifestyle with exchange-rate stress.
+- Glide path investing, where asset allocation changes as retirement gets closer.
+- Dynamic spending guardrails, so the plan trims withdrawals slightly after bad market years instead of pretending spending never moves.
+- Healthcare and long-term care cost ramps later in life.
+- Emergency cash floor, so the app separates truly investable assets from reserve cash.
+- Legacy goal or inheritance target, so the model optimises for both lifestyle and what you want left behind.
+"""
 )
-cashflow_df["Display"] = cashflow_df["Value"].map(lambda value: fmt_money(value, inputs.currency))
-st.dataframe(cashflow_df[["Item", "Display"]], use_container_width=True, hide_index=True)
-
-st.subheader("Projection")
-projection_chart = projection[["age", "liquid_end", "net_worth_end"]].copy().set_index("age")
-st.line_chart(projection_chart)
-
-st.subheader("Monte Carlo distribution")
-mc_chart = pd.DataFrame(
-    {
-        "Age": mc_df.columns.astype(int),
-        "Median": mc_df.median(axis=0).values,
-        "10th percentile": mc_df.quantile(0.10, axis=0).values,
-        "90th percentile": mc_df.quantile(0.90, axis=0).values,
-    }
-).set_index("Age")
-st.line_chart(mc_chart)
-
-with st.expander("Detailed annual projection"):
-    display_df = projection.copy()
-    money_cols = [
-        "liquid_start",
-        "contribution",
-        "spending",
-        "income",
-        "growth",
-        "liquid_end",
-        "property_value",
-        "net_worth_end",
-    ]
-    for col in money_cols:
-        display_df[col] = display_df[col].map(lambda value: fmt_money(value, inputs.currency))
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-with st.expander("Model notes"):
-    st.markdown(
-        """
-        - Currency switching changes the displayed symbol only. It does not convert values.
-        - Comma separators are applied in all displayed outputs, cards, and tables.
-        - Streamlit number inputs do not reliably render comma-separated values during typing on every client, so the app formats all outputs consistently after input.
-        - For full FX support next, add exchange-rate inputs and a base-currency calculation layer.
-        """
-    )
