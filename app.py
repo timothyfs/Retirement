@@ -34,6 +34,10 @@ def fmt_pct(value: float, digits: int = 1) -> str:
 def safe_div(a: float, b: float) -> float:
     return 0.0 if b == 0 else a / b
 
+def rerun_requested() -> bool:
+    return bool(st.session_state.get("apply_now", False))
+
+
 
 DEFAULT_SETTINGS = {
     "scenario_name": "Base",
@@ -602,7 +606,6 @@ def readiness_score(success_rate: float, final_liquid: float, legacy_target: flo
 
 
 init_state()
-inputs = normalize_inputs()
 
 st.title("Retirement Planning Optimizer")
 st.caption("Scenario-led retirement planning with multi-asset modelling, debts, life events, Monte Carlo, FX, tax drag, healthcare costs, guardrails, and reverse planning.")
@@ -628,10 +631,27 @@ with st.sidebar:
         st.write(f"Target monthly income: {fmt_money(float(s['target_monthly_income']), s['display_currency'])}")
         st.write(f"Monte Carlo runs: {int(s['mc_runs']):,}")
     st.session_state["settings"] = s
-    st.info("The sidebar now includes a dedicated input-page navigator and quick summary.")
+
+    st.divider()
+    st.header("Submit")
+    st.session_state["auto_recalc"] = st.checkbox(
+        "Auto recalculate",
+        value=st.session_state.get("auto_recalc", False),
+        help="Turn this off to stop Streamlit recalculating after every edit.",
+    )
+    if not st.session_state["auto_recalc"]:
+        if st.button("Apply inputs and recalculate", use_container_width=True, type="primary"):
+            st.session_state["apply_now"] = True
+    else:
+        st.session_state["apply_now"] = True
+
+    st.info("The sidebar now includes a dedicated input-page navigator, quick summary, and a submit step so the model does not keep recalculating while you are still typing.")
 
 tab_names = ["Cockpit", "Household", "Assets & Debt", "Income & Events", "FX & Tax", "Advanced", "Monte Carlo", "Reverse Planner"]
 tabs = st.tabs(tab_names)
+
+should_calculate = st.session_state.get("auto_recalc", False) or st.session_state.get("apply_now", False)
+calculated_inputs = normalize_inputs() if should_calculate else None
 
 for i, name in enumerate(tab_names):
     with tabs[i]:
@@ -647,9 +667,11 @@ with tabs[0]:
     s["inflation"] = c3.slider("Inflation", 0.0, 0.10, float(s["inflation"]), step=0.001, format="%.1f%%")
     s["stress_uplift"] = c4.slider("Stress uplift", -0.20, 0.30, float(s["stress_uplift"]), step=0.01, format="%.0f%%")
     st.session_state["settings"] = s
-    inputs = normalize_inputs()
+    inputs = calculated_inputs if should_calculate else None
 
-    if inputs.household.empty:
+    if not should_calculate:
+        st.info("Editing mode is on. Click **Apply inputs and recalculate** in the sidebar when you are ready.")
+    elif inputs.household.empty:
         st.warning("Enable at least one household member.")
     else:
         proj = build_projection(inputs)
@@ -788,8 +810,10 @@ with tabs[6]:
     s["mc_runs"] = m1.number_input("Monte Carlo runs", 500, 10000, int(s["mc_runs"]), step=500)
     s["random_seed"] = m2.number_input("Random seed", 0, 999999, int(s["random_seed"]), step=1)
     st.session_state["settings"] = s
-    inputs = normalize_inputs()
-    if not inputs.household.empty:
+    inputs = calculated_inputs if should_calculate else None
+    if not should_calculate:
+        st.info("Click **Apply inputs and recalculate** in the sidebar to run Monte Carlo.")
+    elif not inputs.household.empty:
         mc = monte_carlo(inputs)
         chart = pd.DataFrame({"Age": mc.columns.astype(int), "Median": mc.median(axis=0).values, "10th percentile": mc.quantile(0.10, axis=0).values, "90th percentile": mc.quantile(0.90, axis=0).values}).set_index("Age")
         chart = chart.apply(lambda col: col.map(lambda x: from_base(inputs, x, inputs.display_currency)))
@@ -804,8 +828,10 @@ with tabs[7]:
     s["optimizer_max_extra_work_years"] = r3.number_input("Max extra work years", 1, 20, int(s["optimizer_max_extra_work_years"]), step=1)
     s["optimizer_property_sale_step_years"] = r4.number_input("Property timing step", 1, 10, int(s["optimizer_property_sale_step_years"]), step=1)
     st.session_state["settings"] = s
-    inputs = normalize_inputs()
-    if not inputs.household.empty:
+    inputs = calculated_inputs if should_calculate else None
+    if not should_calculate:
+        st.info("Click **Apply inputs and recalculate** in the sidebar to run Monte Carlo.")
+    elif not inputs.household.empty:
         results, notes = optimize(inputs)
         show = results.copy().head(15)
         show["success_rate"] = show["success_rate"].map(lambda x: fmt_pct(float(x)))
@@ -823,3 +849,7 @@ st.markdown(
 - Kept FX, tax, healthcare ramp, emergency cash floor, legacy target, spending guardrails, Monte Carlo, and reverse planner.
 """
 )
+
+
+if st.session_state.get("apply_now", False) and not st.session_state.get("auto_recalc", False):
+    st.session_state["apply_now"] = False
