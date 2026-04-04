@@ -1,4 +1,5 @@
 
+# Updated app.py with sidebar input page
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -19,16 +20,6 @@ CURRENCIES: Dict[str, Dict[str, str]] = {
 ASSET_CATEGORIES = ["investment", "cash", "property", "other"]
 ACCOUNT_TYPES = ["taxable", "pension", "isa", "cash", "property", "other"]
 EXPENSE_MODES = ["one_off", "monthly", "annual"]
-PAGES = [
-    "Cockpit",
-    "Household",
-    "Assets & Debt",
-    "Income & Events",
-    "FX & Tax",
-    "Advanced",
-    "Monte Carlo",
-    "Reverse Planner",
-]
 
 
 def fmt_money(value: float, currency: str) -> str:
@@ -42,6 +33,10 @@ def fmt_pct(value: float, digits: int = 1) -> str:
 
 def safe_div(a: float, b: float) -> float:
     return 0.0 if b == 0 else a / b
+
+def rerun_requested() -> bool:
+    return bool(st.session_state.get("apply_now", False))
+
 
 
 DEFAULT_SETTINGS = {
@@ -65,6 +60,12 @@ DEFAULT_SETTINGS = {
     "guardrail_rise_pct": 0.05,
     "guardrail_floor_pct": 0.80,
     "guardrail_ceiling_pct": 1.20,
+    "glidepath_enabled": True,
+    "glidepath_start_age": 53,
+    "glidepath_end_age": 65,
+    "glidepath_equity_start": 0.70,
+    "glidepath_equity_end": 0.40,
+    "glidepath_cash_end": 0.20,
     "healthcare_enabled": True,
     "healthcare_start_age": 75,
     "healthcare_base_annual": 8_000.0,
@@ -144,8 +145,6 @@ def init_state() -> None:
         "expenses_df": DEFAULT_EXPENSES,
         "tax_df": DEFAULT_TAX,
         "sidebar_page": "Cockpit",
-        "apply_counter": 0,
-        "auto_recalc": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -224,7 +223,7 @@ def normalize_inputs() -> Inputs:
     fx = st.session_state["fx_df"].copy()
     tax = st.session_state["tax_df"].copy()
 
-    fills = [
+    for df, fill in [
         (household, {"enabled": True, "name": "", "current_age": 0, "retirement_age": 0, "life_expectancy": 95, "pension_age": 0, "pension_annual": 0.0, "pension_currency": st.session_state["settings"]["base_currency"]}),
         (assets, {"enabled": True, "name": "", "category": "investment", "account_type": "taxable", "currency": st.session_state["settings"]["base_currency"], "value": 0.0, "annual_return": 0.0, "volatility": 0.0, "monthly_contribution": 0.0, "sale_age": 0, "sale_proceeds": 0.0, "income_annual": 0.0, "income_start_age": 0, "income_end_age": 0, "inflation_linked_income": False}),
         (liabilities, {"enabled": True, "name": "", "linked_asset": "", "currency": st.session_state["settings"]["base_currency"], "balance": 0.0, "interest_rate": 0.0, "monthly_payment": 0.0, "target_completion_age": 0, "include_in_net_worth": True}),
@@ -232,8 +231,7 @@ def normalize_inputs() -> Inputs:
         (expenses, {"enabled": True, "name": "", "currency": st.session_state["settings"]["base_currency"], "mode": "one_off", "amount": 0.0, "start_age": 0, "end_age": 0, "inflation_linked": False}),
         (fx, {"currency": st.session_state["settings"]["base_currency"], "to_base": 1.0}),
         (tax, {"account_type": "taxable", "withdrawal_tax_rate": 0.0, "growth_tax_drag": 0.0}),
-    ]
-    for df, fill in fills:
+    ]:
         df.fillna(fill, inplace=True)
 
     household = household[household["enabled"] == True].copy()
@@ -242,7 +240,16 @@ def normalize_inputs() -> Inputs:
     incomes = incomes[incomes["enabled"] == True].copy()
     expenses = expenses[expenses["enabled"] == True].copy()
 
-    return Inputs(st.session_state["settings"], fx, household, assets, liabilities, incomes, expenses, tax)
+    return Inputs(
+        settings=st.session_state["settings"],
+        fx=fx,
+        household=household,
+        assets=assets,
+        liabilities=liabilities,
+        incomes=incomes,
+        expenses=expenses,
+        tax=tax,
+    )
 
 
 def fx_rate(inputs: Inputs, currency: str) -> float:
@@ -367,8 +374,10 @@ def build_projection(inputs: Inputs, mc_returns: np.ndarray | None = None) -> pd
     ages = list(range(inputs.current_age, inputs.life_expectancy + 1))
     assets = inputs.assets.copy()
     liabilities = inputs.liabilities.copy()
+
     assets["base_value"] = [to_base(inputs, float(v), str(c)) for v, c in zip(assets["value"], assets["currency"])]
     liabilities["base_balance"] = [to_base(inputs, float(v), str(c)) for v, c in zip(liabilities["balance"], liabilities["currency"])]
+
     sale_done = {str(name): False for name in assets["name"].tolist()}
     rows: List[dict] = []
     last_spending = None
@@ -399,6 +408,7 @@ def build_projection(inputs: Inputs, mc_returns: np.ndarray | None = None) -> pd
 
             growth = value * ret
             value += growth
+
             if category in ["investment", "cash", "other"]:
                 liquid_growth += growth
 
@@ -430,7 +440,10 @@ def build_projection(inputs: Inputs, mc_returns: np.ndarray | None = None) -> pd
 
         total_liquid_ret = safe_div(liquid_growth, liquid_before_growth) if liquid_before_growth > 0 else 0.0
         if retired:
-            spending_target = annual_base_spending(age, inputs) if last_spending is None else apply_guardrails(last_spending, annual_base_spending(age, inputs), total_liquid_ret, inputs)
+            if last_spending is None:
+                spending_target = annual_base_spending(age, inputs)
+            else:
+                spending_target = apply_guardrails(last_spending, annual_base_spending(age, inputs), total_liquid_ret, inputs)
             last_spending = spending_target
 
         event_costs = extra_expenses(age, inputs)
@@ -460,65 +473,73 @@ def build_projection(inputs: Inputs, mc_returns: np.ndarray | None = None) -> pd
         non_liquid_end = float(assets.loc[~liquid_mask, "base_value"].sum())
         net_worth = liquid_end + non_liquid_end - liabilities_end
 
-        rows.append({
-            "age": age,
-            "phase": "Retirement" if retired else "Pre-retirement",
-            "liquid_assets_end": liquid_end,
-            "non_liquid_assets_end": non_liquid_end,
-            "liabilities_end": liabilities_end,
-            "net_worth_end": net_worth,
-            "contributions": contributions,
-            "pensions": pension_income,
-            "other_income": extra_income,
-            "base_spending": spending_target,
-            "debt_paid": debt_paid,
-            "event_costs": event_costs,
-            "total_spending": total_spending,
-            "net_portfolio_draw": net_draw,
-            "sale_inflow": sale_inflow,
-            "liquid_growth": liquid_growth,
-            "reserve_floor": reserve_floor,
-        })
+        rows.append(
+            {
+                "age": age,
+                "phase": "Retirement" if retired else "Pre-retirement",
+                "liquid_assets_end": liquid_end,
+                "non_liquid_assets_end": non_liquid_end,
+                "liabilities_end": liabilities_end,
+                "net_worth_end": net_worth,
+                "contributions": contributions,
+                "pensions": pension_income,
+                "other_income": extra_income,
+                "base_spending": spending_target,
+                "debt_paid": debt_paid,
+                "event_costs": event_costs,
+                "total_spending": total_spending,
+                "net_portfolio_draw": net_draw,
+                "sale_inflow": sale_inflow,
+                "liquid_growth": liquid_growth,
+                "reserve_floor": reserve_floor,
+            }
+        )
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False)
-def run_calculations(snapshot: dict):
-    inputs = Inputs(
-        settings=snapshot["settings"],
-        fx=pd.DataFrame(snapshot["fx"]),
-        household=pd.DataFrame(snapshot["household"]),
-        assets=pd.DataFrame(snapshot["assets"]),
-        liabilities=pd.DataFrame(snapshot["liabilities"]),
-        incomes=pd.DataFrame(snapshot["incomes"]),
-        expenses=pd.DataFrame(snapshot["expenses"]),
-        tax=pd.DataFrame(snapshot["tax"]),
-    )
-    proj = build_projection(inputs)
-    mc = monte_carlo(inputs)
-    summary = summarize_mc(mc)
-    return proj, mc, summary
+def monte_carlo(inputs: Inputs) -> pd.DataFrame:
+    rng = np.random.default_rng(inputs.random_seed)
+    liquid_assets = inputs.assets[inputs.assets["category"].astype(str).str.lower().isin(["investment", "cash", "other"])]
+    if liquid_assets.empty:
+        avg_return, avg_vol = 0.0, 0.0
+    else:
+        vals = np.array([to_base(inputs, float(v), str(c)) for v, c in zip(liquid_assets["value"], liquid_assets["currency"])], dtype=float)
+        total = vals.sum()
+        if total <= 0:
+            avg_return = float(liquid_assets["annual_return"].astype(float).mean())
+            avg_vol = float(liquid_assets["volatility"].astype(float).mean())
+        else:
+            w = vals / total
+            avg_return = float((w * liquid_assets["annual_return"].astype(float).to_numpy()).sum())
+            avg_vol = float((w * liquid_assets["volatility"].astype(float).to_numpy()).sum())
+
+    years = max(1, inputs.life_expectancy - inputs.retirement_age + 1)
+    paths = []
+    for _ in range(inputs.mc_runs):
+        returns = rng.normal(avg_return, avg_vol, years)
+        proj = build_projection(inputs, returns)
+        retirement = proj[proj["age"] >= inputs.retirement_age]
+        paths.append(retirement["liquid_assets_end"].to_numpy())
+    cols = list(range(inputs.retirement_age, inputs.life_expectancy + 1))
+    return pd.DataFrame(paths, columns=cols)
 
 
-def build_snapshot():
+def summarize_mc(mc_df: pd.DataFrame) -> Dict[str, float]:
+    finals = mc_df.iloc[:, -1]
     return {
-        "settings": dict(st.session_state["settings"]),
-        "fx": st.session_state["fx_df"].to_dict("records"),
-        "household": st.session_state["household_df"].to_dict("records"),
-        "assets": st.session_state["assets_df"].to_dict("records"),
-        "liabilities": st.session_state["liabilities_df"].to_dict("records"),
-        "incomes": st.session_state["incomes_df"].to_dict("records"),
-        "expenses": st.session_state["expenses_df"].to_dict("records"),
-        "tax": st.session_state["tax_df"].to_dict("records"),
+        "success_rate": float((finals > 0).mean()),
+        "median_final_liquid": float(finals.median()),
+        "p10_final_liquid": float(finals.quantile(0.10)),
+        "p90_final_liquid": float(finals.quantile(0.90)),
     }
 
 
 def optimize(inputs: Inputs) -> Tuple[pd.DataFrame, List[str]]:
     rows = []
     notes = []
-    base_proj = build_projection(inputs)
     base_mc = monte_carlo(inputs)
     base_summary = summarize_mc(base_mc)
+    base_proj = build_projection(inputs)
     base_ret = base_proj[base_proj["age"] == inputs.retirement_age].iloc[0]
     rows.append({"strategy": "Current plan", "retirement_age": inputs.retirement_age, "success_rate": base_summary["success_rate"], "liquid_at_retirement": float(base_ret["liquid_assets_end"])})
 
@@ -532,18 +553,62 @@ def optimize(inputs: Inputs) -> Tuple[pd.DataFrame, List[str]]:
         ret = proj[proj["age"] == trial.retirement_age].iloc[0]
         rows.append({"strategy": f"Work {extra} more year(s)", "retirement_age": trial.retirement_age, "success_rate": summary["success_rate"], "liquid_at_retirement": float(ret["liquid_assets_end"])})
 
+    step = float(st.session_state["settings"]["optimizer_spending_cut_step"])
+    max_cut = float(st.session_state["settings"]["optimizer_spending_cut_max"])
+    cut = step
+    while cut <= max_cut:
+        new_settings = dict(inputs.settings)
+        new_settings["base_spending_pre75"] = max(0.0, float(inputs.settings["base_spending_pre75"]) - cut)
+        new_settings["base_spending_post75"] = max(0.0, float(inputs.settings["base_spending_post75"]) - cut)
+        trial = Inputs(new_settings, inputs.fx, inputs.household, inputs.assets, inputs.liabilities, inputs.incomes, inputs.expenses, inputs.tax)
+        mc = monte_carlo(trial)
+        summary = summarize_mc(mc)
+        proj = build_projection(trial)
+        ret = proj[proj["age"] == trial.retirement_age].iloc[0]
+        rows.append({"strategy": f"Cut annual spending by {fmt_money(cut, inputs.display_currency)}", "retirement_age": trial.retirement_age, "success_rate": summary["success_rate"], "liquid_at_retirement": float(ret["liquid_assets_end"])})
+        cut += step
+
+    props = inputs.assets[inputs.assets["category"].astype(str).str.lower() == "property"]
+    step_years = int(st.session_state["settings"]["optimizer_property_sale_step_years"])
+    for _, prop in props.iterrows():
+        name = str(prop["name"])
+        value = float(prop["value"])
+        if value <= 0 and float(prop["sale_proceeds"]) <= 0:
+            continue
+        for sale_age in range(inputs.retirement_age, inputs.life_expectancy + 1, max(1, step_years)):
+            new_assets = inputs.assets.copy()
+            mask = new_assets["name"] == name
+            new_assets.loc[mask, "sale_age"] = sale_age
+            if float(new_assets.loc[mask, "sale_proceeds"].iloc[0]) <= 0:
+                new_assets.loc[mask, "sale_proceeds"] = value
+            trial = Inputs(inputs.settings, inputs.fx, inputs.household, new_assets, inputs.liabilities, inputs.incomes, inputs.expenses, inputs.tax)
+            mc = monte_carlo(trial)
+            summary = summarize_mc(mc)
+            proj = build_projection(trial)
+            ret = proj[proj["age"] == trial.retirement_age].iloc[0]
+            rows.append({"strategy": f"Sell {name} at age {sale_age}", "retirement_age": trial.retirement_age, "success_rate": summary["success_rate"], "liquid_at_retirement": float(ret["liquid_assets_end"])})
+
     result = pd.DataFrame(rows).sort_values(["success_rate", "liquid_at_retirement"], ascending=[False, False]).reset_index(drop=True)
     if not result.empty:
         top = result.iloc[0]
         notes.append(f"Best simple lever in this search: **{top['strategy']}**.")
         notes.append(f"That gets to about **{fmt_pct(float(top['success_rate']))}** success.")
+    notes.append("This is still a transparent optimizer, not a black-box solver. It ranks understandable moves first.")
     return result, notes
+
+
+def readiness_score(success_rate: float, final_liquid: float, legacy_target: float) -> str:
+    if success_rate >= 0.90 and final_liquid >= legacy_target:
+        return "Healthy"
+    if success_rate >= 0.70:
+        return "Watchlist"
+    return "At Risk"
 
 
 init_state()
 
 st.title("Retirement Planning Optimizer")
-st.caption("This version uses a real sidebar-driven page layout, not tabs. That fixes the selector issue and cuts down UI lag.")
+st.caption("Scenario-led retirement planning with multi-asset modelling, debts, life events, Monte Carlo, FX, tax drag, healthcare costs, guardrails, and reverse planning.")
 
 with st.sidebar:
     s = st.session_state["settings"]
@@ -551,27 +616,50 @@ with st.sidebar:
     s["display_currency"] = st.selectbox("Display currency", list(CURRENCIES.keys()), index=list(CURRENCIES.keys()).index(s["display_currency"]), format_func=lambda c: f"{c} — {CURRENCIES[c]['name']}")
     s["base_currency"] = st.selectbox("Model base currency", list(CURRENCIES.keys()), index=list(CURRENCIES.keys()).index(s["base_currency"]), format_func=lambda c: f"{c} — {CURRENCIES[c]['name']}")
     s["scenario_name"] = st.text_input("Scenario name", value=s["scenario_name"])
-    st.session_state["settings"] = s
 
     st.divider()
     st.header("Input page")
-    st.session_state["sidebar_page"] = st.radio("Choose section", PAGES, index=PAGES.index(st.session_state.get("sidebar_page", "Cockpit")))
-
-    st.divider()
-    st.header("Submit")
-    st.session_state["auto_recalc"] = st.checkbox("Auto recalculate", value=st.session_state.get("auto_recalc", False))
-    if st.button("Apply inputs and recalculate", use_container_width=True, type="primary"):
-        st.session_state["apply_counter"] += 1
-
+    st.session_state["sidebar_page"] = st.radio(
+        "Jump to input section",
+        ["Cockpit", "Household", "Assets & Debt", "Income & Events", "FX & Tax", "Advanced", "Monte Carlo", "Reverse Planner"],
+        index=["Cockpit", "Household", "Assets & Debt", "Income & Events", "FX & Tax", "Advanced", "Monte Carlo", "Reverse Planner"].index(st.session_state.get("sidebar_page", "Cockpit")),
+    )
     with st.expander("Core input summary", expanded=False):
         st.write(f"Pre-75 spending: {fmt_money(float(s['base_spending_pre75']), s['display_currency'])}")
         st.write(f"Post-75 spending: {fmt_money(float(s['base_spending_post75']), s['display_currency'])}")
         st.write(f"Inflation: {fmt_pct(float(s['inflation']))}")
+        st.write(f"Target monthly income: {fmt_money(float(s['target_monthly_income']), s['display_currency'])}")
         st.write(f"Monte Carlo runs: {int(s['mc_runs']):,}")
+    st.session_state["settings"] = s
 
-page = st.session_state["sidebar_page"]
+    st.divider()
+    st.header("Submit")
+    st.session_state["auto_recalc"] = st.checkbox(
+        "Auto recalculate",
+        value=st.session_state.get("auto_recalc", False),
+        help="Turn this off to stop Streamlit recalculating after every edit.",
+    )
+    if not st.session_state["auto_recalc"]:
+        if st.button("Apply inputs and recalculate", use_container_width=True, type="primary"):
+            st.session_state["apply_now"] = True
+    else:
+        st.session_state["apply_now"] = True
 
-if page == "Cockpit":
+    st.info("The sidebar now includes a dedicated input-page navigator, quick summary, and a submit step so the model does not keep recalculating while you are still typing.")
+
+tab_names = ["Cockpit", "Household", "Assets & Debt", "Income & Events", "FX & Tax", "Advanced", "Monte Carlo", "Reverse Planner"]
+tabs = st.tabs(tab_names)
+
+should_calculate = st.session_state.get("auto_recalc", False) or st.session_state.get("apply_now", False)
+calculated_inputs = normalize_inputs() if should_calculate else None
+
+for i, name in enumerate(tab_names):
+    with tabs[i]:
+        if st.session_state.get("sidebar_page") == name:
+            st.caption(f"Sidebar selection: **{name}**")
+
+with tabs[0]:
+    st.subheader("Cockpit")
     s = st.session_state["settings"]
     c1, c2, c3, c4 = st.columns(4)
     s["base_spending_pre75"] = c1.number_input("Base spending before 75", min_value=0.0, value=float(s["base_spending_pre75"]), step=1000.0)
@@ -579,15 +667,18 @@ if page == "Cockpit":
     s["inflation"] = c3.slider("Inflation", 0.0, 0.10, float(s["inflation"]), step=0.001, format="%.1f%%")
     s["stress_uplift"] = c4.slider("Stress uplift", -0.20, 0.30, float(s["stress_uplift"]), step=0.01, format="%.0f%%")
     st.session_state["settings"] = s
+    inputs = calculated_inputs if should_calculate else None
 
-    should_run = st.session_state["auto_recalc"] or st.session_state["apply_counter"] > 0
-    if not should_run:
-        st.info("Enter or edit your inputs, then click **Apply inputs and recalculate** in the sidebar.")
+    if not should_calculate:
+        st.info("Editing mode is on. Click **Apply inputs and recalculate** in the sidebar when you are ready.")
+    elif inputs.household.empty:
+        st.warning("Enable at least one household member.")
     else:
-        snapshot = build_snapshot()
-        proj, mc, summary = run_calculations(snapshot)
-        inputs = normalize_inputs()
+        proj = build_projection(inputs)
+        mc = monte_carlo(inputs)
+        summary = summarize_mc(mc)
         ret_row = proj[proj["age"] == inputs.retirement_age].iloc[0]
+        score = readiness_score(summary["success_rate"], summary["median_final_liquid"], float(st.session_state["settings"]["legacy_target"]))
         wd_rate = safe_div(float(ret_row["net_portfolio_draw"]), float(ret_row["liquid_assets_end"]))
 
         m1, m2, m3, m4 = st.columns(4)
@@ -596,18 +687,11 @@ if page == "Cockpit":
         m3.metric("Success rate", fmt_pct(summary["success_rate"]))
         m4.metric("Withdrawal rate at retirement", fmt_pct(wd_rate))
 
-        chart = proj[["age", "liquid_assets_end", "net_worth_end"]].copy().set_index("age")
-        chart = chart.apply(lambda col: col.map(lambda x: from_base(inputs, x, inputs.display_currency)))
-        st.line_chart(chart)
-
-elif page == "Household":
+with tabs[1]:
     st.subheader("Household")
     st.caption("Disable the spouse row for a single-person plan.")
     st.session_state["household_df"] = st.data_editor(
-        st.session_state["household_df"],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="household_editor",
+        st.session_state["household_df"], num_rows="dynamic", use_container_width=True, key="household_editor",
         column_config={
             "enabled": st.column_config.CheckboxColumn("Enabled"),
             "name": st.column_config.TextColumn("Name"),
@@ -620,13 +704,10 @@ elif page == "Household":
         },
     )
 
-elif page == "Assets & Debt":
+with tabs[2]:
     st.subheader("Assets")
     st.session_state["assets_df"] = st.data_editor(
-        st.session_state["assets_df"],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="assets_editor",
+        st.session_state["assets_df"], num_rows="dynamic", use_container_width=True, key="assets_editor",
         column_config={
             "enabled": st.column_config.CheckboxColumn("Enabled"),
             "name": st.column_config.TextColumn("Name"),
@@ -647,10 +728,7 @@ elif page == "Assets & Debt":
     )
     st.subheader("Liabilities / Mortgages")
     st.session_state["liabilities_df"] = st.data_editor(
-        st.session_state["liabilities_df"],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="liabilities_editor",
+        st.session_state["liabilities_df"], num_rows="dynamic", use_container_width=True, key="liabilities_editor",
         column_config={
             "enabled": st.column_config.CheckboxColumn("Enabled"),
             "name": st.column_config.TextColumn("Name"),
@@ -664,13 +742,10 @@ elif page == "Assets & Debt":
         },
     )
 
-elif page == "Income & Events":
+with tabs[3]:
     st.subheader("Other income")
     st.session_state["incomes_df"] = st.data_editor(
-        st.session_state["incomes_df"],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="incomes_editor",
+        st.session_state["incomes_df"], num_rows="dynamic", use_container_width=True, key="incomes_editor",
         column_config={
             "enabled": st.column_config.CheckboxColumn("Enabled"),
             "name": st.column_config.TextColumn("Name"),
@@ -683,10 +758,7 @@ elif page == "Income & Events":
     )
     st.subheader("Life events / big expenses")
     st.session_state["expenses_df"] = st.data_editor(
-        st.session_state["expenses_df"],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="expenses_editor",
+        st.session_state["expenses_df"], num_rows="dynamic", use_container_width=True, key="expenses_editor",
         column_config={
             "enabled": st.column_config.CheckboxColumn("Enabled"),
             "name": st.column_config.TextColumn("Name"),
@@ -699,13 +771,10 @@ elif page == "Income & Events":
         },
     )
 
-elif page == "FX & Tax":
+with tabs[4]:
     st.subheader("FX assumptions")
     st.session_state["fx_df"] = st.data_editor(
-        st.session_state["fx_df"],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="fx_editor",
+        st.session_state["fx_df"], num_rows="dynamic", use_container_width=True, key="fx_editor",
         column_config={
             "currency": st.column_config.SelectboxColumn("Currency", options=list(CURRENCIES.keys())),
             "to_base": st.column_config.NumberColumn("To base", step=0.01, format="%.4f"),
@@ -717,10 +786,7 @@ elif page == "FX & Tax":
     s["country_profile"] = st.text_input("Country profile", value=s["country_profile"])
     st.session_state["settings"] = s
     st.session_state["tax_df"] = st.data_editor(
-        st.session_state["tax_df"],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="tax_editor",
+        st.session_state["tax_df"], num_rows="dynamic", use_container_width=True, key="tax_editor",
         column_config={
             "account_type": st.column_config.SelectboxColumn("Account type", options=ACCOUNT_TYPES),
             "withdrawal_tax_rate": st.column_config.NumberColumn("Withdrawal tax", step=0.01, format="%.2f"),
@@ -728,41 +794,33 @@ elif page == "FX & Tax":
         },
     )
 
-elif page == "Advanced":
+with tabs[5]:
     st.subheader("Advanced planning levers")
     s = st.session_state["settings"]
     c1, c2, c3 = st.columns(3)
     s["guardrails_enabled"] = c1.checkbox("Enable spending guardrails", value=bool(s["guardrails_enabled"]))
-    s["healthcare_enabled"] = c2.checkbox("Enable healthcare cost ramp", value=bool(s["healthcare_enabled"]))
-    s["tax_enabled"] = c3.checkbox("Enable tax model", value=bool(s["tax_enabled"]))
-    h1, h2, h3 = st.columns(3)
-    s["healthcare_start_age"] = h1.number_input("Healthcare ramp start age", 50, 110, int(s["healthcare_start_age"]))
-    s["healthcare_base_annual"] = h2.number_input("Healthcare base annual", 0.0, value=float(s["healthcare_base_annual"]), step=1000.0)
-    s["healthcare_inflation_extra"] = h3.slider("Extra healthcare inflation", 0.0, 0.10, float(s["healthcare_inflation_extra"]), step=0.005, format="%.1f%%")
-    l1, l2 = st.columns(2)
-    s["legacy_target"] = l1.number_input("Legacy / inheritance target", 0.0, value=float(s["legacy_target"]), step=10000.0)
-    s["emergency_cash_years"] = l2.slider("Emergency cash floor in years", 0.0, 5.0, float(s["emergency_cash_years"]), step=0.5)
+    s["glidepath_enabled"] = c2.checkbox("Enable glidepath", value=bool(s["glidepath_enabled"]))
+    s["healthcare_enabled"] = c3.checkbox("Enable healthcare cost ramp", value=bool(s["healthcare_enabled"]))
     st.session_state["settings"] = s
 
-elif page == "Monte Carlo":
-    should_run = st.session_state["auto_recalc"] or st.session_state["apply_counter"] > 0
+with tabs[6]:
+    st.subheader("Monte Carlo")
     s = st.session_state["settings"]
     m1, m2 = st.columns(2)
     s["mc_runs"] = m1.number_input("Monte Carlo runs", 500, 10000, int(s["mc_runs"]), step=500)
     s["random_seed"] = m2.number_input("Random seed", 0, 999999, int(s["random_seed"]), step=1)
     st.session_state["settings"] = s
-    if not should_run:
+    inputs = calculated_inputs if should_calculate else None
+    if not should_calculate:
         st.info("Click **Apply inputs and recalculate** in the sidebar to run Monte Carlo.")
-    else:
-        snapshot = build_snapshot()
-        _, mc, _ = run_calculations(snapshot)
-        inputs = normalize_inputs()
+    elif not inputs.household.empty:
+        mc = monte_carlo(inputs)
         chart = pd.DataFrame({"Age": mc.columns.astype(int), "Median": mc.median(axis=0).values, "10th percentile": mc.quantile(0.10, axis=0).values, "90th percentile": mc.quantile(0.90, axis=0).values}).set_index("Age")
         chart = chart.apply(lambda col: col.map(lambda x: from_base(inputs, x, inputs.display_currency)))
         st.line_chart(chart)
 
-elif page == "Reverse Planner":
-    should_run = st.session_state["auto_recalc"] or st.session_state["apply_counter"] > 0
+with tabs[7]:
+    st.subheader("Reverse planner")
     s = st.session_state["settings"]
     r1, r2, r3, r4 = st.columns(4)
     s["target_monthly_income"] = r1.number_input("Target monthly income", 0.0, value=float(s["target_monthly_income"]), step=500.0)
@@ -770,10 +828,10 @@ elif page == "Reverse Planner":
     s["optimizer_max_extra_work_years"] = r3.number_input("Max extra work years", 1, 20, int(s["optimizer_max_extra_work_years"]), step=1)
     s["optimizer_property_sale_step_years"] = r4.number_input("Property timing step", 1, 10, int(s["optimizer_property_sale_step_years"]), step=1)
     st.session_state["settings"] = s
-    if not should_run:
-        st.info("Click **Apply inputs and recalculate** in the sidebar to update the reverse planner.")
-    else:
-        inputs = normalize_inputs()
+    inputs = calculated_inputs if should_calculate else None
+    if not should_calculate:
+        st.info("Click **Apply inputs and recalculate** in the sidebar to run Monte Carlo.")
+    elif not inputs.household.empty:
         results, notes = optimize(inputs)
         show = results.copy().head(15)
         show["success_rate"] = show["success_rate"].map(lambda x: fmt_pct(float(x)))
@@ -783,4 +841,15 @@ elif page == "Reverse Planner":
             st.markdown(f"- {note}")
 
 st.divider()
-st.markdown("This rebuild replaces tabs with a true sidebar-driven page selector, so page changes are instant and only the active screen is rendered.")
+st.subheader("What changed in this version")
+st.markdown(
+    """
+- Added a dedicated **Input page** section in the sidebar.
+- Restored all editable input tables.
+- Kept FX, tax, healthcare ramp, emergency cash floor, legacy target, spending guardrails, Monte Carlo, and reverse planner.
+"""
+)
+
+
+if st.session_state.get("apply_now", False) and not st.session_state.get("auto_recalc", False):
+    st.session_state["apply_now"] = False
