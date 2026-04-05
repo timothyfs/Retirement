@@ -659,63 +659,6 @@ def invalidate_result_cache() -> None:
 
 
 # Sidebar
-
-def assumptions_summary(inputs: Inputs) -> pd.DataFrame:
-    enabled_household = inputs.household[inputs.household["enabled"] == True]
-    enabled_assets = inputs.assets[inputs.assets["enabled"] == True]
-    enabled_debts = inputs.debts[inputs.debts["enabled"] == True]
-    enabled_income = inputs.extra_income[inputs.extra_income["enabled"] == True]
-    enabled_expenses = inputs.expenses[inputs.expenses["enabled"] == True]
-
-    total_assets = float(enabled_assets["value"].apply(as_float).sum()) if not enabled_assets.empty else 0.0
-    total_debts = float(enabled_debts["balance"].apply(as_float).sum()) if not enabled_debts.empty else 0.0
-    total_contrib = float(enabled_assets["monthly_contribution"].apply(as_float).sum()) * 12.0 if not enabled_assets.empty else 0.0
-    total_other_income = float(enabled_income["annual_amount"].apply(as_float).sum()) if not enabled_income.empty else 0.0
-    total_event_expenses = float(enabled_expenses["amount"].apply(as_float).sum()) if not enabled_expenses.empty else 0.0
-
-    rows = [
-        ("Scenario", str(inputs.settings.get("scenario_name", "Base"))),
-        ("People included", str(int(enabled_household.shape[0]))),
-        ("Current age used", str(inputs.current_age)),
-        ("Retirement age used", str(inputs.retirement_age)),
-        ("Life expectancy used", str(inputs.life_expectancy)),
-        ("Annual spending before 75", fmt_money(as_float(inputs.settings.get("spending_pre75", 0.0)), inputs.display_currency)),
-        ("Annual spending after 75", fmt_money(as_float(inputs.settings.get("spending_post75", 0.0)), inputs.display_currency)),
-        ("Inflation", fmt_pct(as_float(inputs.settings.get("inflation", 0.025)))),
-        ("Healthcare ramp", "On" if as_bool(inputs.settings.get("healthcare_enabled", False)) else "Off"),
-        ("Healthcare annual cost", fmt_money(as_float(inputs.settings.get("healthcare_annual", 0.0)), inputs.display_currency)),
-        ("Emergency cash floor", f"{as_float(inputs.settings.get('emergency_cash_years', 0.0)):.1f} years"),
-        ("Legacy target", fmt_money(as_float(inputs.settings.get("legacy_target", 0.0)), inputs.display_currency)),
-        ("Total assets entered", fmt_money(total_assets, inputs.display_currency)),
-        ("Total debts entered", fmt_money(total_debts, inputs.display_currency)),
-        ("Annual contributions", fmt_money(total_contrib, inputs.display_currency)),
-        ("Other annual income", fmt_money(total_other_income, inputs.display_currency)),
-        ("Enabled extra expense rows", str(int(enabled_expenses.shape[0]))),
-        ("Monte Carlo", "On" if inputs.monte_carlo_enabled else "Off"),
-        ("Monte Carlo runs", str(inputs.mc_runs if inputs.monte_carlo_enabled else 0)),
-    ]
-    return pd.DataFrame(rows, columns=["Assumption", "Value"])
-
-
-def input_explainers():
-    st.markdown("### What each input section means")
-    with st.expander("Household"):
-        st.write("Add the people included in the plan. Current age, retirement age, life expectancy, and pension age are the dates the model uses for the timeline. Pension annual is the yearly state pension or other guaranteed pension you expect.")
-    with st.expander("Assets"):
-        st.write("Add savings, portfolios, property, and cash here. Monthly contribution is what you are still adding before retirement. Sale age and sale proceeds are optional and only matter if you plan to sell an asset later.")
-    with st.expander("Debts"):
-        st.write("Add mortgages and loans here. Monthly payment is what you expect to pay. The model reduces the debt balance each year using the interest rate and payment you enter.")
-    with st.expander("Extra income"):
-        st.write("Use this for consulting, rent, part time work, or any other income stream that starts and stops at certain ages.")
-    with st.expander("Large expenses"):
-        st.write("Use this for weddings, cars, school fees, holidays, or major one off spending. Choose One off, Monthly, or Annual depending on how the cost happens.")
-    with st.expander("Advanced assumptions"):
-        st.write("These are the plan-wide assumptions. Spending before and after 75 are your baseline retirement spending targets. Inflation increases future spending. Healthcare adds an extra late-life cost ramp. Monte Carlo is optional and stress tests the plan with random return paths.")
-    with st.expander("Results"):
-        st.write("Results show the baseline plan outcome. Run this first before using Optimizer. If Monte Carlo is off, the results are deterministic only.")
-    with st.expander("Optimizer"):
-        st.write("Optimizer answers a simple question in plain English: what happens if you work longer? It does not run Monte Carlo. It compares straightforward scenarios like working 1, 2, or more extra years and shows which one improves liquid assets at retirement the most.")
-
 with st.sidebar:
     settings = st.session_state["settings"]
     st.header("Planner")
@@ -754,7 +697,6 @@ st.caption("Stable v1. Faster by default. Monte Carlo runs only when you explici
 if page == "Basic Inputs":
     st.subheader("Basic inputs")
     st.markdown("Enter the core facts of the plan. Keep this simple first.")
-    input_explainers()
     st.info("These tables are for the main financial facts only. Advanced assumptions live on the next page.")
     st.markdown("**Household**")
     edited = st.data_editor(df_from_records(st.session_state["household_records"]), num_rows="dynamic", use_container_width=True, key="household_editor_v2")
@@ -775,7 +717,6 @@ if page == "Basic Inputs":
 elif page == "Advanced Assumptions":
     st.subheader("Advanced assumptions")
     st.markdown("Use number inputs instead of sliders so values are precise and stable.")
-    st.info("These assumptions control how hard the model pushes your plan over time. Higher inflation and higher spending make retirement harder. Monte Carlo is optional and should usually stay off while you are still editing.")
     s = st.session_state["settings"]
     c1, c2, c3 = st.columns(3)
     s["spending_pre75"] = c1.number_input("Annual spending before 75", min_value=0.0, value=as_float(s["spending_pre75"], 100000.0), step=1000.0)
@@ -882,7 +823,6 @@ elif page == "Results":
 elif page == "Optimizer":
     st.subheader("Optimizer")
     st.markdown("Run Results first so you understand the baseline. Then use this page to test simple levers.")
-    st.info("Plain English explanation: the Optimizer checks simple versions of one idea only — working longer. It shows how much more liquid money you may have at retirement if you work 1, 2, 3, or more extra years. It is fast because it does not run Monte Carlo.")
     inputs, _ = get_inputs_from_state()
     current_hash = inputs.fingerprint()
 
