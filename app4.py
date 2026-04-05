@@ -77,8 +77,7 @@ def safe_div(a: float, b: float) -> float:
     return 0.0 if b == 0 else a / b
 
 
-# FIX 1: Changed list[dict] -> List[dict] for Python 3.8 compatibility
-def df_from_records(records: List[dict]) -> pd.DataFrame:
+def df_from_records(records: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
@@ -191,27 +190,16 @@ class Inputs:
         return as_bool(self.settings.get("enable_monte_carlo", False), False)
 
 
-# FIX 2: Replaced df.get(col, default).apply() with a safe column-existence check.
-# DataFrame.get() is unreliable for missing columns — it can return a scalar
-# instead of a Series, causing .apply() to crash.
-
-def _safe_col(df: pd.DataFrame, col: str, default):
-    """Return df[col] if it exists, else a Series filled with default."""
-    if col in df.columns:
-        return df[col]
-    return pd.Series([default] * len(df), index=df.index)
-
-
 def clean_household(records):
     df = df_from_records(records)
     if df.empty:
         return pd.DataFrame(columns=["enabled","name","current_age","retirement_age","life_expectancy","pension_age","pension_annual","pension_currency"])
-    df["enabled"] = _safe_col(df, "enabled", False).apply(as_bool)
-    df["name"] = _safe_col(df, "name", "").apply(str)
+    df["enabled"] = df.get("enabled", False).apply(as_bool)
+    df["name"] = df.get("name", "").apply(str)
     for col in ["current_age", "retirement_age", "life_expectancy", "pension_age"]:
-        df[col] = _safe_col(df, col, 0).apply(as_int)
-    df["pension_annual"] = _safe_col(df, "pension_annual", 0.0).apply(as_float)
-    df["pension_currency"] = _safe_col(df, "pension_currency", "EUR").apply(clean_currency)
+        df[col] = df.get(col, 0).apply(as_int)
+    df["pension_annual"] = df.get("pension_annual", 0.0).apply(as_float)
+    df["pension_currency"] = df.get("pension_currency", "EUR").apply(clean_currency)
     return df
 
 
@@ -219,15 +207,15 @@ def clean_assets(records):
     df = df_from_records(records)
     if df.empty:
         return pd.DataFrame(columns=["enabled","name","asset_type","currency","value","annual_return","volatility","monthly_contribution","sale_age","sale_proceeds","income_annual","income_start_age","income_end_age","inflation_linked_income"])
-    df["enabled"] = _safe_col(df, "enabled", False).apply(as_bool)
-    df["name"] = _safe_col(df, "name", "").apply(str)
-    df["asset_type"] = _safe_col(df, "asset_type", "Other").apply(lambda x: x if x in ASSET_TYPES else "Other")
-    df["currency"] = _safe_col(df, "currency", "EUR").apply(clean_currency)
+    df["enabled"] = df.get("enabled", False).apply(as_bool)
+    df["name"] = df.get("name", "").apply(str)
+    df["asset_type"] = df.get("asset_type", "Other").apply(lambda x: x if x in ASSET_TYPES else "Other")
+    df["currency"] = df.get("currency", "EUR").apply(clean_currency)
     for col in ["value","annual_return","volatility","monthly_contribution","sale_proceeds","income_annual"]:
-        df[col] = _safe_col(df, col, 0.0).apply(as_float)
+        df[col] = df.get(col, 0.0).apply(as_float)
     for col in ["sale_age","income_start_age","income_end_age"]:
-        df[col] = _safe_col(df, col, 0).apply(as_int)
-    df["inflation_linked_income"] = _safe_col(df, "inflation_linked_income", False).apply(as_bool)
+        df[col] = df.get(col, 0).apply(as_int)
+    df["inflation_linked_income"] = df.get("inflation_linked_income", False).apply(as_bool)
     return df
 
 
@@ -235,13 +223,13 @@ def clean_debts(records):
     df = df_from_records(records)
     if df.empty:
         return pd.DataFrame(columns=["enabled","name","debt_type","currency","balance","interest_rate","monthly_payment","include_in_net_worth"])
-    df["enabled"] = _safe_col(df, "enabled", False).apply(as_bool)
-    df["name"] = _safe_col(df, "name", "").apply(str)
-    df["debt_type"] = _safe_col(df, "debt_type", "Other").apply(lambda x: x if x in DEBT_TYPES else "Other")
-    df["currency"] = _safe_col(df, "currency", "EUR").apply(clean_currency)
+    df["enabled"] = df.get("enabled", False).apply(as_bool)
+    df["name"] = df.get("name", "").apply(str)
+    df["debt_type"] = df.get("debt_type", "Other").apply(lambda x: x if x in DEBT_TYPES else "Other")
+    df["currency"] = df.get("currency", "EUR").apply(clean_currency)
     for col in ["balance","interest_rate","monthly_payment"]:
-        df[col] = _safe_col(df, col, 0.0).apply(as_float)
-    df["include_in_net_worth"] = _safe_col(df, "include_in_net_worth", True).apply(as_bool)
+        df[col] = df.get(col, 0.0).apply(as_float)
+    df["include_in_net_worth"] = df.get("include_in_net_worth", True).apply(as_bool)
     return df
 
 
@@ -249,13 +237,13 @@ def clean_extra_income(records):
     df = df_from_records(records)
     if df.empty:
         return pd.DataFrame(columns=["enabled","name","currency","annual_amount","start_age","end_age","inflation_linked"])
-    df["enabled"] = _safe_col(df, "enabled", False).apply(as_bool)
-    df["name"] = _safe_col(df, "name", "").apply(str)
-    df["currency"] = _safe_col(df, "currency", "EUR").apply(clean_currency)
-    df["annual_amount"] = _safe_col(df, "annual_amount", 0.0).apply(as_float)
-    df["start_age"] = _safe_col(df, "start_age", 0).apply(as_int)
-    df["end_age"] = _safe_col(df, "end_age", 0).apply(as_int)
-    df["inflation_linked"] = _safe_col(df, "inflation_linked", False).apply(as_bool)
+    df["enabled"] = df.get("enabled", False).apply(as_bool)
+    df["name"] = df.get("name", "").apply(str)
+    df["currency"] = df.get("currency", "EUR").apply(clean_currency)
+    df["annual_amount"] = df.get("annual_amount", 0.0).apply(as_float)
+    df["start_age"] = df.get("start_age", 0).apply(as_int)
+    df["end_age"] = df.get("end_age", 0).apply(as_int)
+    df["inflation_linked"] = df.get("inflation_linked", False).apply(as_bool)
     return df
 
 
@@ -263,14 +251,14 @@ def clean_expenses(records):
     df = df_from_records(records)
     if df.empty:
         return pd.DataFrame(columns=["enabled","name","currency","expense_type","amount","start_age","end_age","inflation_linked"])
-    df["enabled"] = _safe_col(df, "enabled", False).apply(as_bool)
-    df["name"] = _safe_col(df, "name", "").apply(str)
-    df["currency"] = _safe_col(df, "currency", "EUR").apply(clean_currency)
-    df["expense_type"] = _safe_col(df, "expense_type", "One off").apply(lambda x: x if x in EXPENSE_TYPES else "One off")
-    df["amount"] = _safe_col(df, "amount", 0.0).apply(as_float)
-    df["start_age"] = _safe_col(df, "start_age", 0).apply(as_int)
-    df["end_age"] = _safe_col(df, "end_age", 0).apply(as_int)
-    df["inflation_linked"] = _safe_col(df, "inflation_linked", False).apply(as_bool)
+    df["enabled"] = df.get("enabled", False).apply(as_bool)
+    df["name"] = df.get("name", "").apply(str)
+    df["currency"] = df.get("currency", "EUR").apply(clean_currency)
+    df["expense_type"] = df.get("expense_type", "One off").apply(lambda x: x if x in EXPENSE_TYPES else "One off")
+    df["amount"] = df.get("amount", 0.0).apply(as_float)
+    df["start_age"] = df.get("start_age", 0).apply(as_int)
+    df["end_age"] = df.get("end_age", 0).apply(as_int)
+    df["inflation_linked"] = df.get("inflation_linked", False).apply(as_bool)
     return df
 
 
@@ -398,10 +386,7 @@ def build_projection(inputs, retirement_returns=None):
         enabled_assets = pd.DataFrame(columns=assets.columns)
 
     enabled_assets["current_value"] = enabled_assets["value"].apply(as_float)
-
-    # FIX 3: Guard against empty debts DataFrame before assigning current_balance
-    if not enabled_debts.empty:
-        enabled_debts["current_balance"] = enabled_debts["balance"].apply(as_float)
+    enabled_debts["current_balance"] = enabled_debts["balance"].apply(as_float)
 
     sale_done = {str(name): False for name in enabled_assets.get("name", pd.Series(dtype=str)).tolist()}
     rows = []
@@ -509,11 +494,6 @@ def monte_carlo(inputs, progress_bar=None, progress_text=None):
     years = max(1, inputs.life_expectancy - inputs.retirement_age + 1)
     paths = []
     runs = inputs.mc_runs
-
-    # FIX 4: Reset progress bar to 0 before starting Monte Carlo runs
-    if progress_bar is not None:
-        progress_bar.progress(0.0)
-
     for i in range(runs):
         returns = rng.normal(avg_return, avg_vol, years)
         projection = build_projection(inputs, returns)
@@ -536,7 +516,7 @@ def make_snapshot():
         "extra_income": list(st.session_state["extra_income_records"]),
         "expenses": list(st.session_state["expense_records"]),
     }
-    return json.dumps(snapshot, sort_keys=True, indent=2)
+    return json.dumps(snapshot, sort_keys=True)
 
 
 def optimize(inputs):
@@ -561,7 +541,6 @@ def optimize(inputs):
     return result, notes
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     settings = st.session_state["settings"]
     st.header("Planner")
@@ -580,20 +559,7 @@ with st.sidebar:
     if st.button("Run plan", use_container_width=True, type="primary"):
         st.session_state["run_counter"] += 1
 
-    # FIX 5: Expose make_snapshot() as a download button so it's actually useful
-    st.divider()
-    st.header("Export")
-    snapshot_json = make_snapshot()
-    st.download_button(
-        label="Download snapshot (JSON)",
-        data=snapshot_json,
-        file_name=f"retirement_plan_{settings['scenario_name']}.json",
-        mime="application/json",
-        use_container_width=True,
-    )
 
-
-# ── Main ─────────────────────────────────────────────────────────────────────
 page = st.session_state["page"]
 st.title("Retirement Planner")
 st.caption("Stable v1. Faster by default. Monte Carlo runs only when you explicitly enable it.")
@@ -634,11 +600,7 @@ elif page == "Advanced Assumptions":
     s["enable_monte_carlo"] = c10.checkbox("Enable Monte Carlo", value=as_bool(s.get("enable_monte_carlo", False), False))
     s["mc_runs"] = c11.number_input("Monte Carlo runs", min_value=200, max_value=5000, value=as_int(s["mc_runs"], 200), step=100)
     c12.info("Higher run counts will slow the plan down.")
-
-    # FIX 6: Added missing random_seed input so users can actually change it
-    c13, c14, _ = st.columns(3)
-    s["random_seed"] = c13.number_input("Random seed", min_value=0, max_value=99999, value=as_int(s.get("random_seed", 42), 42), step=1, help="Change this to get different Monte Carlo paths")
-    s["optimizer_max_extra_years"] = c14.number_input("Max extra work years to test", min_value=1, max_value=20, value=as_int(s["optimizer_max_extra_years"], 10), step=1)
+    s["optimizer_max_extra_years"] = st.number_input("Max extra work years to test", min_value=1, max_value=20, value=as_int(s["optimizer_max_extra_years"], 10), step=1)
     st.session_state["settings"] = s
 
 elif page == "Results":
