@@ -716,6 +716,148 @@ def input_explainers():
     with st.expander("Optimizer"):
         st.write("Optimizer answers a simple question in plain English: what happens if you work longer? It does not run Monte Carlo. It compares straightforward scenarios like working 1, 2, or more extra years and shows which one improves liquid assets at retirement the most.")
 
+
+def current_balance_sheet(inputs: Inputs) -> pd.DataFrame:
+    assets = inputs.assets[inputs.assets["enabled"] == True].copy()
+    debts = inputs.debts[inputs.debts["enabled"] == True].copy()
+    liquid_now = float(assets.loc[assets["asset_type"].isin(["Investment", "Cash", "Other"]), "value"].apply(as_float).sum()) if not assets.empty else 0.0
+    property_now = float(assets.loc[assets["asset_type"] == "Property", "value"].apply(as_float).sum()) if not assets.empty else 0.0
+    debts_now = float(debts["balance"].apply(as_float).sum()) if not debts.empty else 0.0
+    net_now = liquid_now + property_now - debts_now
+    return pd.DataFrame([
+        ("Liquid assets today", liquid_now),
+        ("Property value today", property_now),
+        ("Debt today", debts_now),
+        ("Net worth today", net_now),
+    ], columns=["Item", "Value"])
+
+
+def build_projection_with_sale_lines(inputs: Inputs, retirement_returns=None):
+    assets = inputs.assets.copy()
+    debts = inputs.debts.copy()
+    enabled_assets = assets[assets["enabled"] == True].copy()
+    enabled_debts = debts[debts["enabled"] == True].copy()
+
+    if enabled_assets.empty:
+        enabled_assets = pd.DataFrame(columns=assets.columns)
+
+    enabled_assets["current_value"] = enabled_assets["value"].apply(as_float)
+    enabled_debts["current_balance"] = enabled_debts["balance"].apply(as_float)
+
+    sale_done = {str(name): False for name in enabled_assets.get("name", pd.Series(dtype=str)).tolist()}
+    rows = []
+
+    for age in range(inputs.current_age, inputs.life_expectancy + 1):
+        retired = age >= inputs.retirement_age
+        contributions = 0.0
+        sale_inflow = 0.0
+
+        liquid_mask = enabled_assets["asset_type"].astype(str).isin(["Investment", "Cash", "Other"]) if not enabled_assets.empty else pd.Series(dtype=bool)
+        property_mask = enabled_assets["asset_type"].astype(str).isin(["Property"]) if not enabled_assets.empty else pd.Series(dtype=bool)
+
+        for idx, row in enabled_assets.iterrows():
+            value = as_float(enabled_assets.at[idx, "current_value"], 0.0)
+            asset_type = str(row["asset_type"])
+            if not retired and asset_type in ["Investment", "Cash", "Other"]:
+                contrib = as_float(row["monthly_contribution"], 0.0) * 12.0
+                value += contrib
+                contributions += contrib
+            annual_return = as_float(row["annual_return"], 0.0)
+            if retirement_returns is not None and retired and asset_type in ["Investment", "Cash", "Other"]:
+                annual_return = as_float(retirement_returns[age - inputs.retirement_age], annual_return)
+            value += value * annual_return
+
+            sale_age = as_int(row["sale_age"], 0)
+            sale_proceeds = as_float(row["sale_proceeds"], 0.0)
+            name = str(row["name"])
+            if sale_age > 0 and age >= sale_age and not sale_done.get(name, False):
+                if sale_proceeds > 0:
+                    sale_inflow += sale_proceeds
+                    if asset_type == "Property":
+                        value = max(0.0, value - sale_proceeds)
+                sale_done[name] = True
+            enabled_assets.at[idx, "current_value"] = max(0.0, value)
+
+        if sale_inflow > 0 and not enabled_assets.empty:
+            cash_candidates = enabled_assets.index[enabled_assets["asset_type"] == "Cash"].tolist()
+            if cash_candidates:
+                idx = cash_candidates[0]
+                enabled_assets.at[idx, "current_value"] = as_float(enabled_assets.at[idx, "current_value"], 0.0) + sale_inflow
+            else:
+                # create a synthetic cash bucket so property sales visibly become cash
+                new_row = {col: None for col in enabled_assets.columns}
+                new_row["enabled"] = True
+                new_row["name"] = "Sale proceeds cash"
+                new_row["asset_type"] = "Cash"
+                new_row["currency"] = inputs.display_currency
+                new_row["current_value"] = sale_inflow
+                new_row["value"] = 0.0
+                new_row["annual_return"] = 0.0
+                new_row["volatility"] = 0.0
+                new_row["monthly_contribution"] = 0.0
+                new_row["sale_age"] = 0
+                new_row["sale_proceeds"] = 0.0
+                new_row["income_annual"] = 0.0
+                new_row["income_start_age"] = 0
+                new_row["income_end_age"] = 0
+                new_row["inflation_linked_income"] = False
+                enabled_assets = pd.concat([enabled_assets, pd.DataFrame([new_row])], ignore_index=True)
+                liquid_mask = enabled_assets["asset_type"].astype(str).isin(["Investment", "Cash", "Other"])
+                property_mask = enabled_assets["asset_type"].astype(str).isin(["Property"])
+
+        debt_paid = 0.0
+        liabilities_end = 0.0
+        for idx, row in enabled_debts.iterrows():
+            new_balance, paid = amortize_one_year(as_float(enabled_debts.at[idx, "current_balance"], 0.0), as_float(row["interest_rate"], 0.0), as_float(row["monthly_payment"], 0.0))
+            enabled_debts.at[idx, "current_balance"] = new_balance
+            debt_paid += paid
+            if as_bool(row["include_in_net_worth"], True):
+                liabilities_end += new_balance
+
+        pensions = annual_pension_income(age, inputs)
+        other_income = annual_other_income(age, inputs)
+        base_spending = annual_base_spending(age, inputs) if retired else 0.0
+        event_expenses = annual_event_expenses(age, inputs)
+        total_spending = base_spending + debt_paid + event_expenses
+
+        liquid_total_pre_draw = float(enabled_assets.loc[liquid_mask, "current_value"].sum()) if not enabled_assets.empty and liquid_mask.any() else 0.0
+        property_total = float(enabled_assets.loc[property_mask, "current_value"].sum()) if not enabled_assets.empty and property_mask.any() else 0.0
+        reserve_floor = as_float(inputs.settings["emergency_cash_years"], 2.0) * (base_spending + annual_healthcare(age, inputs))
+        net_need = max(0.0, total_spending - pensions - other_income)
+        available_draw = max(0.0, liquid_total_pre_draw - reserve_floor)
+        draw = min(available_draw, net_need)
+
+        if not enabled_assets.empty and liquid_mask.any() and draw > 0:
+            liquid_before = float(enabled_assets.loc[liquid_mask, "current_value"].sum())
+            if liquid_before > 0:
+                ratio = max(0.0, (liquid_before - draw) / liquid_before)
+                enabled_assets.loc[liquid_mask, "current_value"] = enabled_assets.loc[liquid_mask, "current_value"] * ratio
+
+        liquid_end = float(enabled_assets.loc[liquid_mask, "current_value"].sum()) if not enabled_assets.empty and liquid_mask.any() else 0.0
+        property_end = float(enabled_assets.loc[property_mask, "current_value"].sum()) if not enabled_assets.empty and property_mask.any() else 0.0
+        net_worth = liquid_end + property_end - liabilities_end
+
+        rows.append({
+            "age": age,
+            "phase": "Retirement" if retired else "Pre retirement",
+            "liquid_assets_end": liquid_end,
+            "property_assets_end": property_end,
+            "sale_inflow": sale_inflow,
+            "liabilities_end": liabilities_end,
+            "net_worth_end": net_worth,
+            "contributions": contributions,
+            "pensions": pensions,
+            "other_income": other_income,
+            "base_spending": base_spending,
+            "debt_paid": debt_paid,
+            "event_expenses": event_expenses,
+            "total_spending": total_spending,
+            "net_portfolio_draw": draw,
+            "reserve_floor": reserve_floor,
+        })
+
+    return pd.DataFrame(rows)
+
 with st.sidebar:
     settings = st.session_state["settings"]
     st.header("Planner")
@@ -807,76 +949,86 @@ elif page == "Results":
         st.info("Click **Run plan** in the sidebar first.")
     else:
         inputs, warnings = get_inputs_from_state()
-        current_hash = inputs.fingerprint()
-        need_recompute = (current_hash != st.session_state.get("cached_inputs_hash"))
 
-        if need_recompute:
-            status = st.empty()
-            progress = st.progress(0.0)
+        status = st.empty()
+        progress = st.progress(0.0)
 
-            status.caption("Step 1 of 2: running core projection...")
-            projection = _cached_projection(*_inputs_to_json_args(inputs))
-            progress.progress(0.35)
+        status.caption("Step 1 of 2: running core projection...")
+        projection = build_projection_with_sale_lines(inputs)
+        progress.progress(0.35)
 
-            if inputs.monte_carlo_enabled:
-                status.caption("Step 2 of 2: running Monte Carlo...")
-                mc_text = st.empty()
-                mc = monte_carlo(inputs, progress_bar=progress, progress_text=mc_text)
-                finals = mc.iloc[:, -1]
-                summary = {
-                    "success_rate": float((finals > 0).mean()),
-                    "median_final_liquid": float(finals.median()),
-                    "p10_final_liquid": float(finals.quantile(0.10)),
-                }
-                mc_text.empty()
-            else:
-                status.caption("Step 2 of 2: Monte Carlo skipped.")
-                progress.progress(1.0)
-                mc = None
-                final_liquid = float(projection.iloc[-1]["liquid_assets_end"])
-                summary = {
-                    "success_rate": float("nan"),
-                    "median_final_liquid": final_liquid,
-                    "p10_final_liquid": final_liquid,
-                }
-
-            status.empty()
-            progress.empty()
-
-            st.session_state["cached_projection"] = projection
-            st.session_state["cached_mc"] = mc
-            st.session_state["cached_summary"] = summary
-            st.session_state["cached_inputs_hash"] = current_hash
-            st.session_state["baseline_completed_hash"] = current_hash
-
+        if inputs.monte_carlo_enabled:
+            status.caption("Step 2 of 2: running Monte Carlo...")
+            mc_text = st.empty()
+            mc = monte_carlo(inputs, progress_bar=progress, progress_text=mc_text)
+            finals = mc.iloc[:, -1]
+            summary = {
+                "success_rate": float((finals > 0).mean()),
+                "median_final_liquid": float(finals.median()),
+                "p10_final_liquid": float(finals.quantile(0.10)),
+            }
+            mc_text.empty()
         else:
-            projection = st.session_state["cached_projection"]
-            mc = st.session_state["cached_mc"]
-            summary = st.session_state["cached_summary"]
+            status.caption("Step 2 of 2: Monte Carlo skipped.")
+            progress.progress(1.0)
+            mc = None
+            final_liquid = float(projection.iloc[-1]["liquid_assets_end"])
+            summary = {
+                "success_rate": float("nan"),
+                "median_final_liquid": final_liquid,
+                "p10_final_liquid": final_liquid,
+            }
 
+        status.empty()
+        progress.empty()
+
+        today_df = current_balance_sheet(inputs)
         retirement_row = projection[projection["age"] == inputs.retirement_age].iloc[0]
+        prev_retirement_row = projection[projection["age"] == max(inputs.current_age, inputs.retirement_age - 1)].iloc[0]
+
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Current net worth", fmt_money(as_float(projection.iloc[0]["net_worth_end"], 0.0), inputs.display_currency))
-        m2.metric("Liquid at retirement", fmt_money(as_float(retirement_row["liquid_assets_end"], 0.0), inputs.display_currency))
+        m1.metric("Net worth today", fmt_money(as_float(today_df.loc[today_df["Item"] == "Net worth today", "Value"].iloc[0], 0.0), inputs.display_currency))
+        m2.metric("Liquid assets at retirement start", fmt_money(as_float(prev_retirement_row["liquid_assets_end"], 0.0), inputs.display_currency))
         m3.metric("Success rate", "Monte Carlo off" if not inputs.monte_carlo_enabled else fmt_pct(summary["success_rate"]))
-        m4.metric("Withdrawal rate at retirement", fmt_pct(safe_div(as_float(retirement_row["net_portfolio_draw"], 0.0), as_float(retirement_row["liquid_assets_end"], 0.0))))
+        m4.metric("Withdrawal rate in first retirement year", fmt_pct(safe_div(as_float(retirement_row["net_portfolio_draw"], 0.0), max(as_float(prev_retirement_row["liquid_assets_end"], 0.0), 1e-9))))
+
+        m5, m6, m7 = st.columns(3)
+        m5.metric("Liquid assets at end of first retirement year", fmt_money(as_float(retirement_row["liquid_assets_end"], 0.0), inputs.display_currency))
+        m6.metric("Median final liquid", fmt_money(as_float(summary["median_final_liquid"], 0.0), inputs.display_currency))
+        m7.metric("10th percentile final liquid", fmt_money(as_float(summary["p10_final_liquid"], 0.0), inputs.display_currency))
+
+        st.markdown("### Run settings used")
+        st.dataframe(assumptions_summary(inputs), use_container_width=True, hide_index=True)
+
+        if inputs.monte_carlo_enabled:
+            st.success(f"Monte Carlo was ON for this run with {inputs.mc_runs:,} simulations.")
+        else:
+            st.info("Monte Carlo was OFF for this run. These results use the deterministic projection only.")
 
         if warnings:
             st.warning("Some incomplete values were defaulted safely.")
             for w in warnings:
                 st.markdown(f"- {w}")
 
-        chart = projection[["age", "liquid_assets_end", "net_worth_end"]].copy().set_index("age")
+        st.markdown("### Balance sheet today")
+        today_display = today_df.copy()
+        today_display["Value"] = today_display["Value"].map(lambda x: fmt_money(as_float(x, 0.0), inputs.display_currency))
+        st.dataframe(today_display, use_container_width=True, hide_index=True)
+
+        st.markdown("### Projection")
+        chart = projection[["age", "liquid_assets_end", "property_assets_end", "net_worth_end"]].copy().set_index("age")
         st.line_chart(chart)
 
+        sale_rows = projection[projection["sale_inflow"] > 0][["age", "sale_inflow"]].copy()
+        if not sale_rows.empty:
+            st.markdown("### Property sales converted to cash")
+            sale_rows["sale_inflow"] = sale_rows["sale_inflow"].map(lambda x: fmt_money(as_float(x, 0.0), inputs.display_currency))
+            sale_rows.columns = ["Age", "Sale proceeds moved into liquid assets"]
+            st.dataframe(sale_rows, use_container_width=True, hide_index=True)
+
         if mc is not None:
-            st.markdown("**Monte Carlo**")
-            mc_chart = pd.DataFrame({
-                "Age": mc.columns.astype(int),
-                "Median": mc.median(axis=0).values,
-                "10th percentile": mc.quantile(0.10, axis=0).values,
-                "90th percentile": mc.quantile(0.90, axis=0).values,
-            }).set_index("Age")
+            st.markdown("### Monte Carlo")
+            mc_chart = pd.DataFrame({"Age": mc.columns.astype(int), "Median": mc.median(axis=0).values, "10th percentile": mc.quantile(0.10, axis=0).values, "90th percentile": mc.quantile(0.90, axis=0).values}).set_index("Age")
             st.line_chart(mc_chart)
 
 elif page == "Optimizer":
