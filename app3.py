@@ -98,8 +98,7 @@ DEFAULT_SETTINGS = {
     "healthcare_extra_inflation": 0.02,
     "legacy_target": 250000.0,
     "emergency_cash_years": 2.0,
-    "enable_monte_carlo": False,
-    "mc_runs": 200,
+    "mc_runs": 1000,
     "random_seed": 42,
     "optimizer_max_extra_years": 10,
 }
@@ -179,15 +178,11 @@ class Inputs:
 
     @property
     def mc_runs(self) -> int:
-        return as_int(self.settings["mc_runs"], 200)
+        return as_int(self.settings["mc_runs"], 1000)
 
     @property
     def random_seed(self) -> int:
         return as_int(self.settings["random_seed"], 42)
-
-    @property
-    def monte_carlo_enabled(self) -> bool:
-        return as_bool(self.settings.get("enable_monte_carlo", False), False)
 
 
 def clean_household(records):
@@ -394,8 +389,8 @@ def build_projection(inputs, retirement_returns=None):
     for age in range(inputs.current_age, inputs.life_expectancy + 1):
         retired = age >= inputs.retirement_age
         contributions = 0.0
+        liquid_growth = 0.0
         sale_inflow = 0.0
-
         liquid_mask = enabled_assets["asset_type"].astype(str).isin(["Investment", "Cash", "Other"]) if not enabled_assets.empty else pd.Series(dtype=bool)
 
         for idx, row in enabled_assets.iterrows():
@@ -408,7 +403,10 @@ def build_projection(inputs, retirement_returns=None):
             annual_return = as_float(row["annual_return"], 0.0)
             if retirement_returns is not None and retired and asset_type in ["Investment", "Cash", "Other"]:
                 annual_return = as_float(retirement_returns[age - inputs.retirement_age], annual_return)
-            value += value * annual_return
+            growth = value * annual_return
+            value += growth
+            if asset_type in ["Investment", "Cash", "Other"]:
+                liquid_growth += growth
             sale_age = as_int(row["sale_age"], 0)
             sale_proceeds = as_float(row["sale_proceeds"], 0.0)
             name = str(row["name"])
@@ -473,7 +471,7 @@ def build_projection(inputs, retirement_returns=None):
     return pd.DataFrame(rows)
 
 
-def monte_carlo(inputs, progress_bar=None, progress_text=None):
+def monte_carlo(inputs):
     rng = np.random.default_rng(inputs.random_seed)
     enabled_assets = inputs.assets[inputs.assets["enabled"] == True].copy()
     liquid_assets = enabled_assets[enabled_assets["asset_type"].isin(["Investment", "Cash", "Other"])]
@@ -493,18 +491,35 @@ def monte_carlo(inputs, progress_bar=None, progress_text=None):
 
     years = max(1, inputs.life_expectancy - inputs.retirement_age + 1)
     paths = []
-    runs = inputs.mc_runs
-    for i in range(runs):
+    for _ in range(inputs.mc_runs):
         returns = rng.normal(avg_return, avg_vol, years)
         projection = build_projection(inputs, returns)
         retirement_projection = projection[projection["age"] >= inputs.retirement_age]
         paths.append(retirement_projection["liquid_assets_end"].to_numpy())
-        if progress_bar is not None and runs > 0:
-            fraction = (i + 1) / runs
-            progress_bar.progress(min(fraction, 1.0))
-            if progress_text is not None:
-                progress_text.caption(f"Monte Carlo progress: {i + 1:,} / {runs:,}")
+
     return pd.DataFrame(paths, columns=list(range(inputs.retirement_age, inputs.life_expectancy + 1)))
+
+
+@st.cache_data(show_spinner=False)
+def run_plan(snapshot_json):
+    snapshot = json.loads(snapshot_json)
+    inputs = Inputs(
+        settings=dict(snapshot["settings"]),
+        household=clean_household(snapshot["household"]),
+        assets=clean_assets(snapshot["assets"]),
+        debts=clean_debts(snapshot["debts"]),
+        extra_income=clean_extra_income(snapshot["extra_income"]),
+        expenses=clean_expenses(snapshot["expenses"]),
+    )
+    projection = build_projection(inputs)
+    mc = monte_carlo(inputs)
+    finals = mc.iloc[:, -1]
+    summary = {
+        "success_rate": float((finals > 0).mean()),
+        "median_final_liquid": float(finals.median()),
+        "p10_final_liquid": float(finals.quantile(0.10)),
+    }
+    return projection, mc, summary
 
 
 def make_snapshot():
@@ -522,22 +537,25 @@ def make_snapshot():
 def optimize(inputs):
     rows = []
     base_projection = build_projection(inputs)
+    base_mc = monte_carlo(inputs)
+    base_success = float((base_mc.iloc[:, -1] > 0).mean())
     base_ret = base_projection[base_projection["age"] == inputs.retirement_age].iloc[0]
-    rows.append({"strategy": "Current plan", "retirement_age": inputs.retirement_age, "liquid_at_retirement": float(base_ret["liquid_assets_end"])})
+    rows.append({"strategy": "Current plan", "retirement_age": inputs.retirement_age, "success_rate": base_success, "liquid_at_retirement": float(base_ret["liquid_assets_end"])})
     max_extra = as_int(inputs.settings["optimizer_max_extra_years"], 10)
     for extra in range(1, max_extra + 1):
         trial_household = inputs.household.copy()
         trial_household["retirement_age"] = trial_household["retirement_age"].apply(as_int) + extra
         trial_inputs = Inputs(inputs.settings, trial_household, inputs.assets, inputs.debts, inputs.extra_income, inputs.expenses)
         trial_projection = build_projection(trial_inputs)
+        trial_mc = monte_carlo(trial_inputs)
+        trial_success = float((trial_mc.iloc[:, -1] > 0).mean())
         trial_ret = trial_projection[trial_projection["age"] == trial_inputs.retirement_age].iloc[0]
-        rows.append({"strategy": f"Work {extra} more year(s)", "retirement_age": trial_inputs.retirement_age, "liquid_at_retirement": float(trial_ret["liquid_assets_end"])})
-    result = pd.DataFrame(rows).sort_values(["liquid_at_retirement"], ascending=[False]).reset_index(drop=True)
-    notes = [
-        "The optimizer only uses the deterministic projection.",
-        "It does not run Monte Carlo. That keeps it fast and easier to understand.",
-        "Use Results first. Then use Optimizer to see which simple lever improves the outcome most."
-    ]
+        rows.append({"strategy": f"Work {extra} more year(s)", "retirement_age": trial_inputs.retirement_age, "success_rate": trial_success, "liquid_at_retirement": float(trial_ret["liquid_assets_end"])})
+    result = pd.DataFrame(rows).sort_values(["success_rate", "liquid_at_retirement"], ascending=[False, False]).reset_index(drop=True)
+    notes = []
+    if not result.empty:
+        notes.append(f"Best simple lever right now: **{result.iloc[0]['strategy']}**.")
+        notes.append(f"That gets to about **{fmt_pct(float(result.iloc[0]['success_rate']))}** success.")
     return result, notes
 
 
@@ -562,7 +580,7 @@ with st.sidebar:
 
 page = st.session_state["page"]
 st.title("Retirement Planner")
-st.caption("Stable v1. Faster by default. Monte Carlo runs only when you explicitly enable it.")
+st.caption("Stable v1: calculations only run when you ask, and blank fields default safely.")
 
 if page == "Basic Inputs":
     st.subheader("Basic inputs")
@@ -594,13 +612,9 @@ elif page == "Advanced Assumptions":
     s["healthcare_extra_inflation"] = c7.number_input("Extra healthcare inflation", min_value=0.0, max_value=0.20, value=as_float(s["healthcare_extra_inflation"], 0.02), step=0.001, format="%.3f")
     s["legacy_target"] = c8.number_input("Legacy target", min_value=0.0, value=as_float(s["legacy_target"], 250000.0), step=10000.0)
     s["emergency_cash_years"] = c9.number_input("Emergency cash floor in years", min_value=0.0, max_value=5.0, value=as_float(s["emergency_cash_years"], 2.0), step=0.5)
-
-    st.markdown("**Monte Carlo**")
-    c10, c11, c12 = st.columns(3)
-    s["enable_monte_carlo"] = c10.checkbox("Enable Monte Carlo", value=as_bool(s.get("enable_monte_carlo", False), False))
-    s["mc_runs"] = c11.number_input("Monte Carlo runs", min_value=200, max_value=5000, value=as_int(s["mc_runs"], 200), step=100)
-    c12.info("Higher run counts will slow the plan down.")
-    s["optimizer_max_extra_years"] = st.number_input("Max extra work years to test", min_value=1, max_value=20, value=as_int(s["optimizer_max_extra_years"], 10), step=1)
+    c10, c11 = st.columns(2)
+    s["mc_runs"] = c10.number_input("Monte Carlo runs", min_value=250, max_value=5000, value=as_int(s["mc_runs"], 1000), step=250)
+    s["optimizer_max_extra_years"] = c11.number_input("Max extra work years to test", min_value=1, max_value=20, value=as_int(s["optimizer_max_extra_years"], 10), step=1)
     st.session_state["settings"] = s
 
 elif page == "Results":
@@ -609,62 +623,26 @@ elif page == "Results":
         st.info("Click **Run plan** in the sidebar first.")
     else:
         inputs, warnings = get_inputs_from_state()
-
-        status = st.empty()
-        progress = st.progress(0.0)
-
-        status.caption("Step 1 of 2: running core projection...")
-        projection = build_projection(inputs)
-        progress.progress(0.35)
-
-        if inputs.monte_carlo_enabled:
-            status.caption("Step 2 of 2: running Monte Carlo...")
-            mc_text = st.empty()
-            mc = monte_carlo(inputs, progress_bar=progress, progress_text=mc_text)
-            finals = mc.iloc[:, -1]
-            summary = {
-                "success_rate": float((finals > 0).mean()),
-                "median_final_liquid": float(finals.median()),
-                "p10_final_liquid": float(finals.quantile(0.10)),
-            }
-            mc_text.empty()
-        else:
-            status.caption("Step 2 of 2: Monte Carlo skipped.")
-            progress.progress(1.0)
-            mc = None
-            final_liquid = float(projection.iloc[-1]["liquid_assets_end"])
-            summary = {
-                "success_rate": float("nan"),
-                "median_final_liquid": final_liquid,
-                "p10_final_liquid": final_liquid,
-            }
-
-        status.empty()
-        progress.empty()
-
+        snapshot_json = make_snapshot()
+        with st.spinner("Running projection and Monte Carlo..."):
+            projection, mc, summary = run_plan(snapshot_json)
         retirement_row = projection[projection["age"] == inputs.retirement_age].iloc[0]
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Current net worth", fmt_money(as_float(projection.iloc[0]["net_worth_end"], 0.0), inputs.display_currency))
         m2.metric("Liquid at retirement", fmt_money(as_float(retirement_row["liquid_assets_end"], 0.0), inputs.display_currency))
-        m3.metric("Success rate", "Monte Carlo off" if not inputs.monte_carlo_enabled else fmt_pct(summary["success_rate"]))
+        m3.metric("Success rate", fmt_pct(summary["success_rate"]))
         m4.metric("Withdrawal rate at retirement", fmt_pct(safe_div(as_float(retirement_row["net_portfolio_draw"], 0.0), as_float(retirement_row["liquid_assets_end"], 0.0))))
-
         if warnings:
             st.warning("Some incomplete values were defaulted safely.")
             for w in warnings:
                 st.markdown(f"- {w}")
-
         chart = projection[["age", "liquid_assets_end", "net_worth_end"]].copy().set_index("age")
         st.line_chart(chart)
-
-        if mc is not None:
-            st.markdown("**Monte Carlo**")
-            mc_chart = pd.DataFrame({"Age": mc.columns.astype(int), "Median": mc.median(axis=0).values, "10th percentile": mc.quantile(0.10, axis=0).values, "90th percentile": mc.quantile(0.90, axis=0).values}).set_index("Age")
-            st.line_chart(mc_chart)
+        mc_chart = pd.DataFrame({"Age": mc.columns.astype(int), "Median": mc.median(axis=0).values, "10th percentile": mc.quantile(0.10, axis=0).values, "90th percentile": mc.quantile(0.90, axis=0).values}).set_index("Age")
+        st.line_chart(mc_chart)
 
 elif page == "Optimizer":
     st.subheader("Optimizer")
-    st.markdown("Run Results first so you understand the baseline. Then use this page to test simple levers.")
     if not (st.session_state["auto_recalc"] or st.session_state["run_counter"] > 0):
         st.info("Click **Run plan** in the sidebar first.")
     else:
@@ -672,10 +650,11 @@ elif page == "Optimizer":
         with st.spinner("Running optimizer..."):
             results, notes = optimize(inputs)
         show = results.copy()
+        show["success_rate"] = show["success_rate"].map(lambda x: fmt_pct(as_float(x, 0.0)))
         show["liquid_at_retirement"] = show["liquid_at_retirement"].map(lambda x: fmt_money(as_float(x, 0.0), inputs.display_currency))
         st.dataframe(show.head(12), use_container_width=True, hide_index=True)
         for note in notes:
             st.markdown(f"- {note}")
 
 st.divider()
-st.markdown("This version keeps Monte Carlo off by default, starts at 200 runs, adds progress feedback, and keeps the optimizer deterministic so it stays fast.")
+st.markdown("Stable v1 baseline. Fewer moving parts, safer input handling, and no direct casting of blank cells.")
