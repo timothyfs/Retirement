@@ -1,6 +1,4 @@
-
 import json
-import hashlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -32,7 +30,7 @@ def fmt_pct(value: float, digits: int = 1) -> str:
     return f"{value:.{digits}%}"
 
 
-def as_float(v, default: float = 0.0) -> float:
+def as_float(v, default=0.0) -> float:
     try:
         if v is None:
             return default
@@ -44,7 +42,7 @@ def as_float(v, default: float = 0.0) -> float:
         return default
 
 
-def as_int(v, default: int = 0) -> int:
+def as_int(v, default=0) -> int:
     try:
         if v is None:
             return default
@@ -56,7 +54,7 @@ def as_int(v, default: int = 0) -> int:
         return default
 
 
-def as_bool(v, default: bool = False) -> bool:
+def as_bool(v, default=False) -> bool:
     if isinstance(v, bool):
         return v
     if isinstance(v, (int, float)):
@@ -80,12 +78,6 @@ def df_from_records(records: List[dict]) -> pd.DataFrame:
 
 def clean_currency(currency: str, default: str = "EUR") -> str:
     return currency if currency in CURRENCIES else default
-
-
-def _safe_col(df: pd.DataFrame, col: str, default):
-    if col in df.columns:
-        return df[col]
-    return pd.Series([default] * len(df), index=df.index)
 
 
 DEFAULT_SETTINGS = {
@@ -143,11 +135,11 @@ def init_state() -> None:
         "page": "Basic Inputs",
         "run_counter": 0,
         "auto_recalc": False,
-        "cached_inputs_hash": None,
-        "baseline_completed_hash": None,
+        # PERF: store computed results so switching pages never retriggers computation
         "cached_projection": None,
         "cached_mc": None,
         "cached_summary": None,
+        "cached_inputs_hash": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -198,19 +190,26 @@ class Inputs:
         return as_bool(self.settings.get("enable_monte_carlo", False), False)
 
     def fingerprint(self) -> str:
-        payload = json.dumps(
-            {
-                "settings": self.settings,
-                "household": self.household.to_dict("records"),
-                "assets": self.assets.to_dict("records"),
-                "debts": self.debts.to_dict("records"),
-                "extra_income": self.extra_income.to_dict("records"),
-                "expenses": self.expenses.to_dict("records"),
-            },
-            sort_keys=True,
-            default=str,
-        )
+        """
+        PERF: A fast MD5 hash of all inputs. If this matches the last run's
+        hash, we skip all computation and show the cached result instantly.
+        """
+        import hashlib
+        payload = json.dumps({
+            "settings": self.settings,
+            "household": self.household.to_dict("records"),
+            "assets": self.assets.to_dict("records"),
+            "debts": self.debts.to_dict("records"),
+            "extra_income": self.extra_income.to_dict("records"),
+            "expenses": self.expenses.to_dict("records"),
+        }, sort_keys=True, default=str)
         return hashlib.md5(payload.encode()).hexdigest()
+
+
+def _safe_col(df: pd.DataFrame, col: str, default):
+    if col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index)
 
 
 def clean_household(records):
@@ -286,7 +285,7 @@ def clean_expenses(records):
 
 
 def get_inputs_from_state():
-    warnings: List[str] = []
+    warnings = []
     inputs = Inputs(
         settings=dict(st.session_state["settings"]),
         household=clean_household(st.session_state["household_records"]),
@@ -299,18 +298,16 @@ def get_inputs_from_state():
         warnings.append("No enabled household member found.")
     if inputs.assets.empty or inputs.assets["enabled"].sum() == 0:
         warnings.append("No enabled asset found.")
-    if (inputs.assets["name"].astype(str).str.strip() == "").any():
-        warnings.append("One or more asset rows have no name.")
     return inputs, warnings
 
 
-def annual_base_spending(age: int, inputs: Inputs) -> float:
+def annual_base_spending(age, inputs):
     base = as_float(inputs.settings["spending_pre75"], 0.0) if age < 75 else as_float(inputs.settings["spending_post75"], 0.0)
     years = max(0, age - inputs.retirement_age)
     return base * ((1.0 + as_float(inputs.settings["inflation"], 0.025)) ** years)
 
 
-def annual_healthcare(age: int, inputs: Inputs) -> float:
+def annual_healthcare(age, inputs):
     if not as_bool(inputs.settings["healthcare_enabled"], True):
         return 0.0
     start_age = as_int(inputs.settings["healthcare_start_age"], 75)
@@ -323,72 +320,72 @@ def annual_healthcare(age: int, inputs: Inputs) -> float:
     return annual * ((1.0 + inflation + extra) ** years)
 
 
-def annual_pension_income(age: int, inputs: Inputs) -> float:
+def annual_pension_income(age, inputs):
     total = 0.0
     inflation = as_float(inputs.settings["inflation"], 0.025)
-    for row in inputs.household.itertuples(index=False):
-        if not as_bool(row.enabled, True):
+    for _, row in inputs.household.iterrows():
+        if not as_bool(row["enabled"], True):
             continue
-        pension_age = as_int(row.pension_age, 0)
+        pension_age = as_int(row["pension_age"], 0)
         if age < pension_age:
             continue
         years = age - pension_age
-        total += as_float(row.pension_annual, 0.0) * ((1.0 + inflation) ** years)
+        total += as_float(row["pension_annual"], 0.0) * ((1.0 + inflation) ** years)
     return total
 
 
-def annual_other_income(age: int, inputs: Inputs) -> float:
+def annual_other_income(age, inputs):
     total = 0.0
     inflation = as_float(inputs.settings["inflation"], 0.025)
-    for row in inputs.extra_income.itertuples(index=False):
-        if not as_bool(row.enabled, True):
+    for _, row in inputs.extra_income.iterrows():
+        if not as_bool(row["enabled"], True):
             continue
-        start_age = as_int(row.start_age, 0)
-        end_age = as_int(row.end_age, 0)
+        start_age = as_int(row["start_age"], 0)
+        end_age = as_int(row["end_age"], 0)
         if age < start_age or age > end_age:
             continue
-        amt = as_float(row.annual_amount, 0.0)
-        if as_bool(row.inflation_linked, False):
+        amt = as_float(row["annual_amount"], 0.0)
+        if as_bool(row["inflation_linked"], False):
             amt *= ((1.0 + inflation) ** max(0, age - start_age))
         total += amt
-    for row in inputs.assets.itertuples(index=False):
-        if not as_bool(row.enabled, True):
+    for _, row in inputs.assets.iterrows():
+        if not as_bool(row["enabled"], True):
             continue
-        start_age = as_int(row.income_start_age, 0)
-        end_age = as_int(row.income_end_age, 0)
+        start_age = as_int(row["income_start_age"], 0)
+        end_age = as_int(row["income_end_age"], 0)
         end_age = end_age if end_age > 0 else inputs.life_expectancy
         if age < start_age or age > end_age:
             continue
-        amt = as_float(row.income_annual, 0.0)
-        if as_bool(row.inflation_linked_income, False):
+        amt = as_float(row["income_annual"], 0.0)
+        if as_bool(row["inflation_linked_income"], False):
             amt *= ((1.0 + inflation) ** max(0, age - start_age))
         total += amt
     return total
 
 
-def annual_event_expenses(age: int, inputs: Inputs) -> float:
+def annual_event_expenses(age, inputs):
     total = annual_healthcare(age, inputs)
     inflation = as_float(inputs.settings["inflation"], 0.025)
-    for row in inputs.expenses.itertuples(index=False):
-        if not as_bool(row.enabled, True):
+    for _, row in inputs.expenses.iterrows():
+        if not as_bool(row["enabled"], True):
             continue
-        start_age = as_int(row.start_age, 0)
-        end_age = as_int(row.end_age, 0)
+        start_age = as_int(row["start_age"], 0)
+        end_age = as_int(row["end_age"], 0)
         if age < start_age or age > end_age:
             continue
-        expense_type = str(row.expense_type)
+        expense_type = str(row["expense_type"])
         if expense_type == "One off" and age != start_age:
             continue
-        amt = as_float(row.amount, 0.0)
+        amt = as_float(row["amount"], 0.0)
         if expense_type == "Monthly":
             amt *= 12.0
-        if as_bool(row.inflation_linked, False):
+        if as_bool(row["inflation_linked"], False):
             amt *= ((1.0 + inflation) ** max(0, age - start_age))
         total += amt
     return total
 
 
-def amortize_one_year(balance: float, annual_rate: float, monthly_payment: float) -> Tuple[float, float]:
+def amortize_one_year(balance, annual_rate, monthly_payment):
     bal = as_float(balance, 0.0)
     paid = 0.0
     for _ in range(12):
@@ -401,7 +398,7 @@ def amortize_one_year(balance: float, annual_rate: float, monthly_payment: float
     return max(0.0, bal), paid
 
 
-def build_projection(inputs: Inputs, retirement_returns=None) -> pd.DataFrame:
+def build_projection(inputs, retirement_returns=None):
     assets = inputs.assets.copy()
     debts = inputs.debts.copy()
     enabled_assets = assets[assets["enabled"] == True].copy()
@@ -411,11 +408,12 @@ def build_projection(inputs: Inputs, retirement_returns=None) -> pd.DataFrame:
         enabled_assets = pd.DataFrame(columns=assets.columns)
 
     enabled_assets["current_value"] = enabled_assets["value"].apply(as_float)
+
     if not enabled_debts.empty:
         enabled_debts["current_balance"] = enabled_debts["balance"].apply(as_float)
 
     sale_done = {str(name): False for name in enabled_assets.get("name", pd.Series(dtype=str)).tolist()}
-    rows: List[dict] = []
+    rows = []
 
     for age in range(inputs.current_age, inputs.life_expectancy + 1):
         retired = age >= inputs.retirement_age
@@ -424,46 +422,36 @@ def build_projection(inputs: Inputs, retirement_returns=None) -> pd.DataFrame:
 
         liquid_mask = enabled_assets["asset_type"].astype(str).isin(["Investment", "Cash", "Other"]) if not enabled_assets.empty else pd.Series(dtype=bool)
 
-        for idx, row in zip(enabled_assets.index, enabled_assets.itertuples(index=False)):
+        for idx, row in enabled_assets.iterrows():
             value = as_float(enabled_assets.at[idx, "current_value"], 0.0)
-            asset_type = str(row.asset_type)
-
+            asset_type = str(row["asset_type"])
             if not retired and asset_type in ["Investment", "Cash", "Other"]:
-                contrib = as_float(row.monthly_contribution, 0.0) * 12.0
+                contrib = as_float(row["monthly_contribution"], 0.0) * 12.0
                 value += contrib
                 contributions += contrib
-
-            annual_return = as_float(row.annual_return, 0.0)
+            annual_return = as_float(row["annual_return"], 0.0)
             if retirement_returns is not None and retired and asset_type in ["Investment", "Cash", "Other"]:
                 annual_return = as_float(retirement_returns[age - inputs.retirement_age], annual_return)
-
             value += value * annual_return
-
-            sale_age = as_int(row.sale_age, 0)
-            sale_proceeds = as_float(row.sale_proceeds, 0.0)
-            name = str(row.name)
+            sale_age = as_int(row["sale_age"], 0)
+            sale_proceeds = as_float(row["sale_proceeds"], 0.0)
+            name = str(row["name"])
             if sale_age > 0 and age >= sale_age and not sale_done.get(name, False):
                 if sale_proceeds > 0:
                     sale_inflow += sale_proceeds
                     if asset_type == "Property":
                         value = max(0.0, value - sale_proceeds)
                 sale_done[name] = True
-
             enabled_assets.at[idx, "current_value"] = max(0.0, value)
 
         debt_paid = 0.0
         liabilities_end = 0.0
-        if not enabled_debts.empty:
-            for idx, row in zip(enabled_debts.index, enabled_debts.itertuples(index=False)):
-                new_balance, paid = amortize_one_year(
-                    as_float(enabled_debts.at[idx, "current_balance"], 0.0),
-                    as_float(row.interest_rate, 0.0),
-                    as_float(row.monthly_payment, 0.0),
-                )
-                enabled_debts.at[idx, "current_balance"] = new_balance
-                debt_paid += paid
-                if as_bool(row.include_in_net_worth, True):
-                    liabilities_end += new_balance
+        for idx, row in enabled_debts.iterrows():
+            new_balance, paid = amortize_one_year(as_float(enabled_debts.at[idx, "current_balance"], 0.0), as_float(row["interest_rate"], 0.0), as_float(row["monthly_payment"], 0.0))
+            enabled_debts.at[idx, "current_balance"] = new_balance
+            debt_paid += paid
+            if as_bool(row["include_in_net_worth"], True):
+                liabilities_end += new_balance
 
         pensions = annual_pension_income(age, inputs)
         other_income = annual_other_income(age, inputs)
@@ -473,7 +461,6 @@ def build_projection(inputs: Inputs, retirement_returns=None) -> pd.DataFrame:
 
         liquid_total = float(enabled_assets.loc[liquid_mask, "current_value"].sum()) if not enabled_assets.empty and liquid_mask.any() else 0.0
         liquid_total += sale_inflow
-
         reserve_floor = as_float(inputs.settings["emergency_cash_years"], 2.0) * (base_spending + annual_healthcare(age, inputs))
         net_need = max(0.0, total_spending - pensions - other_income)
         available_draw = max(0.0, liquid_total - reserve_floor)
@@ -510,7 +497,7 @@ def build_projection(inputs: Inputs, retirement_returns=None) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def monte_carlo(inputs: Inputs, progress_bar=None, progress_text=None):
+def monte_carlo(inputs, progress_bar=None, progress_text=None):
     rng = np.random.default_rng(inputs.random_seed)
     enabled_assets = inputs.assets[inputs.assets["enabled"] == True].copy()
     liquid_assets = enabled_assets[enabled_assets["asset_type"].isin(["Investment", "Cash", "Other"])]
@@ -531,20 +518,47 @@ def monte_carlo(inputs: Inputs, progress_bar=None, progress_text=None):
     years = max(1, inputs.life_expectancy - inputs.retirement_age + 1)
     paths = []
     runs = inputs.mc_runs
+
+    if progress_bar is not None:
+        progress_bar.progress(0.0)
+
     for i in range(runs):
         returns = rng.normal(avg_return, avg_vol, years)
         projection = build_projection(inputs, returns)
         retirement_projection = projection[projection["age"] >= inputs.retirement_age]
         paths.append(retirement_projection["liquid_assets_end"].to_numpy())
         if progress_bar is not None and runs > 0:
-            fraction = 0.35 + ((i + 1) / runs) * 0.65
+            fraction = (i + 1) / runs
             progress_bar.progress(min(fraction, 1.0))
             if progress_text is not None:
                 progress_text.caption(f"Monte Carlo progress: {i + 1:,} / {runs:,}")
+
     return pd.DataFrame(paths, columns=list(range(inputs.retirement_age, inputs.life_expectancy + 1)))
 
 
+# PERF: Cache the optimizer — it runs 10+ full projections internally.
+# Streamlit will skip this entirely if the inputs haven't changed.
+@st.cache_data(show_spinner=False)
+def _cached_optimize(
+    settings_json: str,
+    household_json: str,
+    assets_json: str,
+    debts_json: str,
+    extra_income_json: str,
+    expenses_json: str,
+) -> Tuple[pd.DataFrame, List[str]]:
+    settings = json.loads(settings_json)
+    household = pd.read_json(household_json, orient="records")
+    assets = pd.read_json(assets_json, orient="records")
+    debts = pd.read_json(debts_json, orient="records")
+    extra_income = pd.read_json(extra_income_json, orient="records")
+    expenses = pd.read_json(expenses_json, orient="records")
+    inputs = Inputs(settings, household, assets, debts, extra_income, expenses)
+    return _run_optimize(inputs)
+
+
 def _inputs_to_json_args(inputs: Inputs):
+    """Serialize Inputs into plain JSON strings suitable for cached functions."""
     return (
         json.dumps(inputs.settings, sort_keys=True, default=str),
         inputs.household.to_json(orient="records"),
@@ -555,6 +569,29 @@ def _inputs_to_json_args(inputs: Inputs):
     )
 
 
+def _run_optimize(inputs):
+    rows = []
+    base_projection = build_projection(inputs)
+    base_ret = base_projection[base_projection["age"] == inputs.retirement_age].iloc[0]
+    rows.append({"strategy": "Current plan", "retirement_age": inputs.retirement_age, "liquid_at_retirement": float(base_ret["liquid_assets_end"])})
+    max_extra = as_int(inputs.settings["optimizer_max_extra_years"], 10)
+    for extra in range(1, max_extra + 1):
+        trial_household = inputs.household.copy()
+        trial_household["retirement_age"] = trial_household["retirement_age"].apply(as_int) + extra
+        trial_inputs = Inputs(inputs.settings, trial_household, inputs.assets, inputs.debts, inputs.extra_income, inputs.expenses)
+        trial_projection = build_projection(trial_inputs)
+        trial_ret = trial_projection[trial_projection["age"] == trial_inputs.retirement_age].iloc[0]
+        rows.append({"strategy": f"Work {extra} more year(s)", "retirement_age": trial_inputs.retirement_age, "liquid_at_retirement": float(trial_ret["liquid_assets_end"])})
+    result = pd.DataFrame(rows).sort_values(["liquid_at_retirement"], ascending=[False]).reset_index(drop=True)
+    notes = [
+        "The optimizer only uses the deterministic projection.",
+        "It does not run Monte Carlo. That keeps it fast and easier to understand.",
+        "Use Results first. Then use Optimizer to see which simple lever improves the outcome most.",
+    ]
+    return result, notes
+
+
+# PERF: Cache snapshot serialisation — no need to rebuild on every rerun
 @st.cache_data(show_spinner=False)
 def _cached_snapshot(
     settings_json: str,
@@ -586,78 +623,7 @@ def get_snapshot_json() -> str:
     )
 
 
-@st.cache_data(show_spinner=False)
-def _cached_projection(
-    settings_json: str,
-    household_json: str,
-    assets_json: str,
-    debts_json: str,
-    extra_income_json: str,
-    expenses_json: str,
-) -> pd.DataFrame:
-    settings = json.loads(settings_json)
-    inputs = Inputs(
-        settings,
-        pd.read_json(household_json, orient="records"),
-        pd.read_json(assets_json, orient="records"),
-        pd.read_json(debts_json, orient="records"),
-        pd.read_json(extra_income_json, orient="records"),
-        pd.read_json(expenses_json, orient="records"),
-    )
-    return build_projection(inputs)
-
-
-@st.cache_data(show_spinner=False)
-def _cached_optimize(
-    settings_json: str,
-    household_json: str,
-    assets_json: str,
-    debts_json: str,
-    extra_income_json: str,
-    expenses_json: str,
-) -> Tuple[pd.DataFrame, List[str]]:
-    settings = json.loads(settings_json)
-    inputs = Inputs(
-        settings,
-        pd.read_json(household_json, orient="records"),
-        pd.read_json(assets_json, orient="records"),
-        pd.read_json(debts_json, orient="records"),
-        pd.read_json(extra_income_json, orient="records"),
-        pd.read_json(expenses_json, orient="records"),
-    )
-    return _run_optimize(inputs)
-
-
-def _run_optimize(inputs: Inputs):
-    rows = []
-    base_projection = build_projection(inputs)
-    base_ret = base_projection[base_projection["age"] == inputs.retirement_age].iloc[0]
-    rows.append({"strategy": "Current plan", "retirement_age": inputs.retirement_age, "liquid_at_retirement": float(base_ret["liquid_assets_end"])})
-    max_extra = as_int(inputs.settings["optimizer_max_extra_years"], 10)
-    for extra in range(1, max_extra + 1):
-        trial_household = inputs.household.copy()
-        trial_household["retirement_age"] = trial_household["retirement_age"].apply(as_int) + extra
-        trial_inputs = Inputs(inputs.settings, trial_household, inputs.assets, inputs.debts, inputs.extra_income, inputs.expenses)
-        trial_projection = build_projection(trial_inputs)
-        trial_ret = trial_projection[trial_projection["age"] == trial_inputs.retirement_age].iloc[0]
-        rows.append({"strategy": f"Work {extra} more year(s)", "retirement_age": trial_inputs.retirement_age, "liquid_at_retirement": float(trial_ret["liquid_assets_end"])})
-    result = pd.DataFrame(rows).sort_values(["liquid_at_retirement"], ascending=[False]).reset_index(drop=True)
-    notes = [
-        "The optimizer only uses the deterministic projection.",
-        "It does not run Monte Carlo. That keeps it fast and easier to understand.",
-        "Run Results first. Then use Optimizer to see which simple lever improves the outcome most.",
-    ]
-    return result, notes
-
-
-def invalidate_result_cache() -> None:
-    st.session_state["cached_inputs_hash"] = None
-    st.session_state["cached_projection"] = None
-    st.session_state["cached_mc"] = None
-    st.session_state["cached_summary"] = None
-
-
-# Sidebar
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     settings = st.session_state["settings"]
     st.header("Planner")
@@ -675,20 +641,22 @@ with st.sidebar:
     st.session_state["auto_recalc"] = st.checkbox("Auto recalculate", value=as_bool(st.session_state["auto_recalc"], False))
     if st.button("Run plan", use_container_width=True, type="primary"):
         st.session_state["run_counter"] += 1
-        invalidate_result_cache()
+        # Bust the cache so Results page recomputes on next visit
+        st.session_state["cached_inputs_hash"] = None
 
     st.divider()
     st.header("Export")
+    snapshot_json = get_snapshot_json()
     st.download_button(
         label="Download snapshot (JSON)",
-        data=get_snapshot_json(),
+        data=snapshot_json,
         file_name=f"retirement_plan_{settings['scenario_name']}.json",
         mime="application/json",
         use_container_width=True,
     )
 
 
-# Main
+# ── Main ─────────────────────────────────────────────────────────────────────
 page = st.session_state["page"]
 st.title("Retirement Planner")
 st.caption("Stable v1. Faster by default. Monte Carlo runs only when you explicitly enable it.")
@@ -696,22 +664,16 @@ st.caption("Stable v1. Faster by default. Monte Carlo runs only when you explici
 if page == "Basic Inputs":
     st.subheader("Basic inputs")
     st.markdown("Enter the core facts of the plan. Keep this simple first.")
-    st.info("These tables are for the main financial facts only. Advanced assumptions live on the next page.")
     st.markdown("**Household**")
-    edited = st.data_editor(df_from_records(st.session_state["household_records"]), num_rows="dynamic", use_container_width=True, key="household_editor_v2")
-    st.session_state["household_records"] = edited.to_dict("records")
+    st.session_state["household_records"] = st.data_editor(df_from_records(st.session_state["household_records"]), num_rows="dynamic", use_container_width=True, key="household_editor_v1").to_dict("records")
     st.markdown("**Assets**")
-    edited = st.data_editor(df_from_records(st.session_state["asset_records"]), num_rows="dynamic", use_container_width=True, key="asset_editor_v2")
-    st.session_state["asset_records"] = edited.to_dict("records")
+    st.session_state["asset_records"] = st.data_editor(df_from_records(st.session_state["asset_records"]), num_rows="dynamic", use_container_width=True, key="asset_editor_v1").to_dict("records")
     st.markdown("**Debts**")
-    edited = st.data_editor(df_from_records(st.session_state["debt_records"]), num_rows="dynamic", use_container_width=True, key="debt_editor_v2")
-    st.session_state["debt_records"] = edited.to_dict("records")
+    st.session_state["debt_records"] = st.data_editor(df_from_records(st.session_state["debt_records"]), num_rows="dynamic", use_container_width=True, key="debt_editor_v1").to_dict("records")
     st.markdown("**Extra income**")
-    edited = st.data_editor(df_from_records(st.session_state["extra_income_records"]), num_rows="dynamic", use_container_width=True, key="income_editor_v2")
-    st.session_state["extra_income_records"] = edited.to_dict("records")
+    st.session_state["extra_income_records"] = st.data_editor(df_from_records(st.session_state["extra_income_records"]), num_rows="dynamic", use_container_width=True, key="income_editor_v1").to_dict("records")
     st.markdown("**Large expenses**")
-    edited = st.data_editor(df_from_records(st.session_state["expense_records"]), num_rows="dynamic", use_container_width=True, key="expense_editor_v2")
-    st.session_state["expense_records"] = edited.to_dict("records")
+    st.session_state["expense_records"] = st.data_editor(df_from_records(st.session_state["expense_records"]), num_rows="dynamic", use_container_width=True, key="expense_editor_v1").to_dict("records")
 
 elif page == "Advanced Assumptions":
     st.subheader("Advanced assumptions")
@@ -734,28 +696,30 @@ elif page == "Advanced Assumptions":
     c10, c11, c12 = st.columns(3)
     s["enable_monte_carlo"] = c10.checkbox("Enable Monte Carlo", value=as_bool(s.get("enable_monte_carlo", False), False))
     s["mc_runs"] = c11.number_input("Monte Carlo runs", min_value=200, max_value=5000, value=as_int(s["mc_runs"], 200), step=100)
-    c12.warning("Higher run counts will slow the plan down.")
-    c13, c14 = st.columns(2)
-    s["random_seed"] = c13.number_input("Random seed", min_value=0, max_value=99999, value=as_int(s.get("random_seed", 42), 42), step=1)
+    c12.info("Higher run counts will slow the plan down.")
+
+    c13, c14, _ = st.columns(3)
+    s["random_seed"] = c13.number_input("Random seed", min_value=0, max_value=99999, value=as_int(s.get("random_seed", 42), 42), step=1, help="Change this to get different Monte Carlo paths")
     s["optimizer_max_extra_years"] = c14.number_input("Max extra work years to test", min_value=1, max_value=20, value=as_int(s["optimizer_max_extra_years"], 10), step=1)
     st.session_state["settings"] = s
 
 elif page == "Results":
     st.subheader("Results")
-    st.markdown("This page runs the baseline plan. The optimizer uses this as the starting point.")
     if not (st.session_state["auto_recalc"] or st.session_state["run_counter"] > 0):
         st.info("Click **Run plan** in the sidebar first.")
     else:
         inputs, warnings = get_inputs_from_state()
+
+        # PERF: fingerprint the inputs — if nothing changed, skip all computation
+        # and show the previously stored result instantly.
         current_hash = inputs.fingerprint()
         need_recompute = (current_hash != st.session_state.get("cached_inputs_hash"))
 
         if need_recompute:
             status = st.empty()
             progress = st.progress(0.0)
-
             status.caption("Step 1 of 2: running core projection...")
-            projection = _cached_projection(*_inputs_to_json_args(inputs))
+            projection = build_projection(inputs)
             progress.progress(0.35)
 
             if inputs.monte_carlo_enabled:
@@ -783,13 +747,14 @@ elif page == "Results":
             status.empty()
             progress.empty()
 
+            # Store results so switching pages never triggers a recompute
             st.session_state["cached_projection"] = projection
             st.session_state["cached_mc"] = mc
             st.session_state["cached_summary"] = summary
             st.session_state["cached_inputs_hash"] = current_hash
-            st.session_state["baseline_completed_hash"] = current_hash
 
         else:
+            # PERF: zero computation — instant page switch
             projection = st.session_state["cached_projection"]
             mc = st.session_state["cached_mc"]
             summary = st.session_state["cached_summary"]
@@ -822,12 +787,11 @@ elif page == "Results":
 elif page == "Optimizer":
     st.subheader("Optimizer")
     st.markdown("Run Results first so you understand the baseline. Then use this page to test simple levers.")
-    inputs, _ = get_inputs_from_state()
-    current_hash = inputs.fingerprint()
-
-    if st.session_state.get("baseline_completed_hash") != current_hash:
-        st.info("Run **Results** for the current inputs first. The optimizer is only enabled after the baseline plan is complete.")
+    if not (st.session_state["auto_recalc"] or st.session_state["run_counter"] > 0):
+        st.info("Click **Run plan** in the sidebar first.")
     else:
+        inputs, _ = get_inputs_from_state()
+        # PERF: cached — won't rerun unless inputs change
         with st.spinner("Running optimizer..."):
             results, notes = _cached_optimize(*_inputs_to_json_args(inputs))
         show = results.copy()
@@ -837,4 +801,4 @@ elif page == "Optimizer":
             st.markdown(f"- {note}")
 
 st.divider()
-st.markdown("Updated version: safer column handling, faster row iteration, cached deterministic projection, clearer gating between Results and Optimizer, and better progress feedback.")
+st.markdown("This version keeps Monte Carlo off by default, starts at 200 runs, adds progress feedback, and keeps the optimizer deterministic so it stays fast.")
