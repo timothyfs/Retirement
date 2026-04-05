@@ -1,3 +1,4 @@
+
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -36,7 +37,9 @@ def as_float(v, default=0.0) -> float:
             return default
         if isinstance(v, str):
             s = v.strip().replace(",", "")
-            return default if s == "" else float(s)
+            if s == "":
+                return default
+            return float(s)
         return float(v)
     except Exception:
         return default
@@ -48,7 +51,9 @@ def as_int(v, default=0) -> int:
             return default
         if isinstance(v, str):
             s = v.strip().replace(",", "")
-            return default if s == "" else int(float(s))
+            if s == "":
+                return default
+            return int(float(s))
         return int(float(v))
     except Exception:
         return default
@@ -72,6 +77,7 @@ def safe_div(a: float, b: float) -> float:
     return 0.0 if b == 0 else a / b
 
 
+# FIX 1: Changed list[dict] -> List[dict] for Python 3.8 compatibility
 def df_from_records(records: List[dict]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
@@ -135,11 +141,6 @@ def init_state() -> None:
         "page": "Basic Inputs",
         "run_counter": 0,
         "auto_recalc": False,
-        # PERF: store computed results so switching pages never retriggers computation
-        "cached_projection": None,
-        "cached_mc": None,
-        "cached_summary": None,
-        "cached_inputs_hash": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -189,24 +190,13 @@ class Inputs:
     def monte_carlo_enabled(self) -> bool:
         return as_bool(self.settings.get("enable_monte_carlo", False), False)
 
-    def fingerprint(self) -> str:
-        """
-        PERF: A fast MD5 hash of all inputs. If this matches the last run's
-        hash, we skip all computation and show the cached result instantly.
-        """
-        import hashlib
-        payload = json.dumps({
-            "settings": self.settings,
-            "household": self.household.to_dict("records"),
-            "assets": self.assets.to_dict("records"),
-            "debts": self.debts.to_dict("records"),
-            "extra_income": self.extra_income.to_dict("records"),
-            "expenses": self.expenses.to_dict("records"),
-        }, sort_keys=True, default=str)
-        return hashlib.md5(payload.encode()).hexdigest()
 
+# FIX 2: Replaced df.get(col, default).apply() with a safe column-existence check.
+# DataFrame.get() is unreliable for missing columns — it can return a scalar
+# instead of a Series, causing .apply() to crash.
 
 def _safe_col(df: pd.DataFrame, col: str, default):
+    """Return df[col] if it exists, else a Series filled with default."""
     if col in df.columns:
         return df[col]
     return pd.Series([default] * len(df), index=df.index)
@@ -409,6 +399,7 @@ def build_projection(inputs, retirement_returns=None):
 
     enabled_assets["current_value"] = enabled_assets["value"].apply(as_float)
 
+    # FIX 3: Guard against empty debts DataFrame before assigning current_balance
     if not enabled_debts.empty:
         enabled_debts["current_balance"] = enabled_debts["balance"].apply(as_float)
 
@@ -519,6 +510,7 @@ def monte_carlo(inputs, progress_bar=None, progress_text=None):
     paths = []
     runs = inputs.mc_runs
 
+    # FIX 4: Reset progress bar to 0 before starting Monte Carlo runs
     if progress_bar is not None:
         progress_bar.progress(0.0)
 
@@ -532,44 +524,22 @@ def monte_carlo(inputs, progress_bar=None, progress_text=None):
             progress_bar.progress(min(fraction, 1.0))
             if progress_text is not None:
                 progress_text.caption(f"Monte Carlo progress: {i + 1:,} / {runs:,}")
-
     return pd.DataFrame(paths, columns=list(range(inputs.retirement_age, inputs.life_expectancy + 1)))
 
 
-# PERF: Cache the optimizer — it runs 10+ full projections internally.
-# Streamlit will skip this entirely if the inputs haven't changed.
-@st.cache_data(show_spinner=False)
-def _cached_optimize(
-    settings_json: str,
-    household_json: str,
-    assets_json: str,
-    debts_json: str,
-    extra_income_json: str,
-    expenses_json: str,
-) -> Tuple[pd.DataFrame, List[str]]:
-    settings = json.loads(settings_json)
-    household = pd.read_json(household_json, orient="records")
-    assets = pd.read_json(assets_json, orient="records")
-    debts = pd.read_json(debts_json, orient="records")
-    extra_income = pd.read_json(extra_income_json, orient="records")
-    expenses = pd.read_json(expenses_json, orient="records")
-    inputs = Inputs(settings, household, assets, debts, extra_income, expenses)
-    return _run_optimize(inputs)
+def make_snapshot():
+    snapshot = {
+        "settings": dict(st.session_state["settings"]),
+        "household": list(st.session_state["household_records"]),
+        "assets": list(st.session_state["asset_records"]),
+        "debts": list(st.session_state["debt_records"]),
+        "extra_income": list(st.session_state["extra_income_records"]),
+        "expenses": list(st.session_state["expense_records"]),
+    }
+    return json.dumps(snapshot, sort_keys=True, indent=2)
 
 
-def _inputs_to_json_args(inputs: Inputs):
-    """Serialize Inputs into plain JSON strings suitable for cached functions."""
-    return (
-        json.dumps(inputs.settings, sort_keys=True, default=str),
-        inputs.household.to_json(orient="records"),
-        inputs.assets.to_json(orient="records"),
-        inputs.debts.to_json(orient="records"),
-        inputs.extra_income.to_json(orient="records"),
-        inputs.expenses.to_json(orient="records"),
-    )
-
-
-def _run_optimize(inputs):
+def optimize(inputs):
     rows = []
     base_projection = build_projection(inputs)
     base_ret = base_projection[base_projection["age"] == inputs.retirement_age].iloc[0]
@@ -586,41 +556,9 @@ def _run_optimize(inputs):
     notes = [
         "The optimizer only uses the deterministic projection.",
         "It does not run Monte Carlo. That keeps it fast and easier to understand.",
-        "Use Results first. Then use Optimizer to see which simple lever improves the outcome most.",
+        "Use Results first. Then use Optimizer to see which simple lever improves the outcome most."
     ]
     return result, notes
-
-
-# PERF: Cache snapshot serialisation — no need to rebuild on every rerun
-@st.cache_data(show_spinner=False)
-def _cached_snapshot(
-    settings_json: str,
-    household_json: str,
-    assets_json: str,
-    debts_json: str,
-    extra_income_json: str,
-    expenses_json: str,
-) -> str:
-    snapshot = {
-        "settings": json.loads(settings_json),
-        "household": json.loads(household_json),
-        "assets": json.loads(assets_json),
-        "debts": json.loads(debts_json),
-        "extra_income": json.loads(extra_income_json),
-        "expenses": json.loads(expenses_json),
-    }
-    return json.dumps(snapshot, sort_keys=True, indent=2)
-
-
-def get_snapshot_json() -> str:
-    return _cached_snapshot(
-        json.dumps(st.session_state["settings"], sort_keys=True, default=str),
-        json.dumps(st.session_state["household_records"], default=str),
-        json.dumps(st.session_state["asset_records"], default=str),
-        json.dumps(st.session_state["debt_records"], default=str),
-        json.dumps(st.session_state["extra_income_records"], default=str),
-        json.dumps(st.session_state["expense_records"], default=str),
-    )
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -641,12 +579,11 @@ with st.sidebar:
     st.session_state["auto_recalc"] = st.checkbox("Auto recalculate", value=as_bool(st.session_state["auto_recalc"], False))
     if st.button("Run plan", use_container_width=True, type="primary"):
         st.session_state["run_counter"] += 1
-        # Bust the cache so Results page recomputes on next visit
-        st.session_state["cached_inputs_hash"] = None
 
+    # FIX 5: Expose make_snapshot() as a download button so it's actually useful
     st.divider()
     st.header("Export")
-    snapshot_json = get_snapshot_json()
+    snapshot_json = make_snapshot()
     st.download_button(
         label="Download snapshot (JSON)",
         data=snapshot_json,
@@ -698,6 +635,7 @@ elif page == "Advanced Assumptions":
     s["mc_runs"] = c11.number_input("Monte Carlo runs", min_value=200, max_value=5000, value=as_int(s["mc_runs"], 200), step=100)
     c12.info("Higher run counts will slow the plan down.")
 
+    # FIX 6: Added missing random_seed input so users can actually change it
     c13, c14, _ = st.columns(3)
     s["random_seed"] = c13.number_input("Random seed", min_value=0, max_value=99999, value=as_int(s.get("random_seed", 42), 42), step=1, help="Change this to get different Monte Carlo paths")
     s["optimizer_max_extra_years"] = c14.number_input("Max extra work years to test", min_value=1, max_value=20, value=as_int(s["optimizer_max_extra_years"], 10), step=1)
@@ -710,54 +648,37 @@ elif page == "Results":
     else:
         inputs, warnings = get_inputs_from_state()
 
-        # PERF: fingerprint the inputs — if nothing changed, skip all computation
-        # and show the previously stored result instantly.
-        current_hash = inputs.fingerprint()
-        need_recompute = (current_hash != st.session_state.get("cached_inputs_hash"))
+        status = st.empty()
+        progress = st.progress(0.0)
 
-        if need_recompute:
-            status = st.empty()
-            progress = st.progress(0.0)
-            status.caption("Step 1 of 2: running core projection...")
-            projection = build_projection(inputs)
-            progress.progress(0.35)
+        status.caption("Step 1 of 2: running core projection...")
+        projection = build_projection(inputs)
+        progress.progress(0.35)
 
-            if inputs.monte_carlo_enabled:
-                status.caption("Step 2 of 2: running Monte Carlo...")
-                mc_text = st.empty()
-                mc = monte_carlo(inputs, progress_bar=progress, progress_text=mc_text)
-                finals = mc.iloc[:, -1]
-                summary = {
-                    "success_rate": float((finals > 0).mean()),
-                    "median_final_liquid": float(finals.median()),
-                    "p10_final_liquid": float(finals.quantile(0.10)),
-                }
-                mc_text.empty()
-            else:
-                status.caption("Step 2 of 2: Monte Carlo skipped.")
-                progress.progress(1.0)
-                mc = None
-                final_liquid = float(projection.iloc[-1]["liquid_assets_end"])
-                summary = {
-                    "success_rate": float("nan"),
-                    "median_final_liquid": final_liquid,
-                    "p10_final_liquid": final_liquid,
-                }
-
-            status.empty()
-            progress.empty()
-
-            # Store results so switching pages never triggers a recompute
-            st.session_state["cached_projection"] = projection
-            st.session_state["cached_mc"] = mc
-            st.session_state["cached_summary"] = summary
-            st.session_state["cached_inputs_hash"] = current_hash
-
+        if inputs.monte_carlo_enabled:
+            status.caption("Step 2 of 2: running Monte Carlo...")
+            mc_text = st.empty()
+            mc = monte_carlo(inputs, progress_bar=progress, progress_text=mc_text)
+            finals = mc.iloc[:, -1]
+            summary = {
+                "success_rate": float((finals > 0).mean()),
+                "median_final_liquid": float(finals.median()),
+                "p10_final_liquid": float(finals.quantile(0.10)),
+            }
+            mc_text.empty()
         else:
-            # PERF: zero computation — instant page switch
-            projection = st.session_state["cached_projection"]
-            mc = st.session_state["cached_mc"]
-            summary = st.session_state["cached_summary"]
+            status.caption("Step 2 of 2: Monte Carlo skipped.")
+            progress.progress(1.0)
+            mc = None
+            final_liquid = float(projection.iloc[-1]["liquid_assets_end"])
+            summary = {
+                "success_rate": float("nan"),
+                "median_final_liquid": final_liquid,
+                "p10_final_liquid": final_liquid,
+            }
+
+        status.empty()
+        progress.empty()
 
         retirement_row = projection[projection["age"] == inputs.retirement_age].iloc[0]
         m1, m2, m3, m4 = st.columns(4)
@@ -776,12 +697,7 @@ elif page == "Results":
 
         if mc is not None:
             st.markdown("**Monte Carlo**")
-            mc_chart = pd.DataFrame({
-                "Age": mc.columns.astype(int),
-                "Median": mc.median(axis=0).values,
-                "10th percentile": mc.quantile(0.10, axis=0).values,
-                "90th percentile": mc.quantile(0.90, axis=0).values,
-            }).set_index("Age")
+            mc_chart = pd.DataFrame({"Age": mc.columns.astype(int), "Median": mc.median(axis=0).values, "10th percentile": mc.quantile(0.10, axis=0).values, "90th percentile": mc.quantile(0.90, axis=0).values}).set_index("Age")
             st.line_chart(mc_chart)
 
 elif page == "Optimizer":
@@ -791,9 +707,8 @@ elif page == "Optimizer":
         st.info("Click **Run plan** in the sidebar first.")
     else:
         inputs, _ = get_inputs_from_state()
-        # PERF: cached — won't rerun unless inputs change
         with st.spinner("Running optimizer..."):
-            results, notes = _cached_optimize(*_inputs_to_json_args(inputs))
+            results, notes = optimize(inputs)
         show = results.copy()
         show["liquid_at_retirement"] = show["liquid_at_retirement"].map(lambda x: fmt_money(as_float(x, 0.0), inputs.display_currency))
         st.dataframe(show.head(12), use_container_width=True, hide_index=True)
