@@ -1,6 +1,5 @@
 
 import json
-from io import StringIO
 import hashlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -599,11 +598,11 @@ def _cached_projection(
     settings = json.loads(settings_json)
     inputs = Inputs(
         settings,
-        pd.read_json(StringIO(household_json), orient="records"),
-        pd.read_json(StringIO(assets_json), orient="records"),
-        pd.read_json(StringIO(debts_json), orient="records"),
-        pd.read_json(StringIO(extra_income_json), orient="records"),
-        pd.read_json(StringIO(expenses_json), orient="records"),
+        pd.read_json(household_json, orient="records"),
+        pd.read_json(assets_json, orient="records"),
+        pd.read_json(debts_json, orient="records"),
+        pd.read_json(extra_income_json, orient="records"),
+        pd.read_json(expenses_json, orient="records"),
     )
     return build_projection(inputs)
 
@@ -620,11 +619,11 @@ def _cached_optimize(
     settings = json.loads(settings_json)
     inputs = Inputs(
         settings,
-        pd.read_json(StringIO(household_json), orient="records"),
-        pd.read_json(StringIO(assets_json), orient="records"),
-        pd.read_json(StringIO(debts_json), orient="records"),
-        pd.read_json(StringIO(extra_income_json), orient="records"),
-        pd.read_json(StringIO(expenses_json), orient="records"),
+        pd.read_json(household_json, orient="records"),
+        pd.read_json(assets_json, orient="records"),
+        pd.read_json(debts_json, orient="records"),
+        pd.read_json(extra_income_json, orient="records"),
+        pd.read_json(expenses_json, orient="records"),
     )
     return _run_optimize(inputs)
 
